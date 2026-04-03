@@ -71,29 +71,56 @@ extension ContainerCreateRoute {
             // Validate the requested platform only if provided
             let requestedPlatform = try Platform(from: containerPlatform)
 
-            // Check if image exists locally
+            // Try to find the image with different reference variants
+            let imageRef: String
+            var foundLocally = false
+
+            // First, try the exact reference as provided
             do {
                 _ = try await ClientImage.get(reference: body.Image)
+                imageRef = body.Image
+                foundLocally = true
+                req.logger.debug("Found image with exact reference: \(imageRef)")
             } catch {
+                // If not found, try adding :latest tag if no tag is present
+                let imageWithLatest = body.Image.contains(":") ? body.Image : "\(body.Image):latest"
+                do {
+                    _ = try await ClientImage.get(reference: imageWithLatest)
+                    imageRef = imageWithLatest
+                    foundLocally = true
+                    req.logger.debug("Found image with :latest tag: \(imageRef)")
+                } catch {
+                    // Not found locally, will need to normalize and pull
+                    imageRef = try ClientImage.normalizeReference(body.Image)
+                    req.logger.debug("Image not found locally, normalized reference for pull: \(imageRef)")
+                }
+            }
+
+            if !foundLocally {
                 throw Abort(.notFound, reason: "No such image: \(body.Image)")
             }
 
+            req.logger.info("create: fetching image \(imageRef)")
             let img = try await ClientImage.fetch(
-                reference: body.Image,
+                reference: imageRef,
                 platform: requestedPlatform,
             )
 
             // Unpack a fetched image before use
+            req.logger.info("create: getCreateSnapshot for image")
             try await img.getCreateSnapshot(
                 platform: requestedPlatform
             )
 
+            req.logger.info("create: getting default kernel")
             let kernel = try await ClientKernel.getDefaultKernel(for: .current)
 
+            req.logger.info("create: fetching init image")
             let initImage = try await ClientImage.fetch(
                 reference: ClientImage.initImageRef, platform: .current
             )
 
+            req.logger.info("create: getCreateSnapshot for init image")
             _ = try await initImage.getCreateSnapshot(
                 platform: .current)
 
@@ -341,6 +368,7 @@ extension ContainerCreateRoute {
 
             containerConfiguration.mounts = resolvedMounts
 
+            req.logger.info("create: resolved \(resolvedMounts.count) mounts, creating container")
             let options = ContainerCreateOptions(autoRemove: body.HostConfig?.AutoRemove ?? false)
             let container: ContainerSnapshot
             do {

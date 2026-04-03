@@ -37,7 +37,20 @@ enum ContainerImageUtility {
                 continue
             }
 
-            let configDigest = configFile.replacingOccurrences(of: ".json", with: "")
+            // Extract digest from config path
+            // Docker format can be either "blobs/sha256/<digest>" (BuildKit) or "<digest>.json" (classic)
+            let configDigest: String
+            if configFile.hasSuffix(".json") {
+                // Classic format: "<digest>.json"
+                configDigest = configFile.replacingOccurrences(of: ".json", with: "")
+            } else if configFile.hasPrefix("blobs/sha256/") {
+                // BuildKit format: "blobs/sha256/<digest>"
+                configDigest = String(configFile.dropFirst("blobs/sha256/".count))
+            } else {
+                // Fallback: use as-is
+                configDigest = configFile
+            }
+
             let configSrcPath = dockerFormatPath.appendingPathComponent(configFile)
             let configDstPath = blobsDir.appendingPathComponent(configDigest)
 
@@ -57,7 +70,20 @@ enum ContainerImageUtility {
                 var layerDescriptors: [[String: Any]] = []
 
                 for layer in layers {
-                    let layerDigest = layer.replacingOccurrences(of: "/layer.tar", with: "")
+                    // Extract digest from layer path
+                    // Docker format can be either "blobs/sha256/<digest>" (BuildKit) or "<digest>/layer.tar" (classic)
+                    let layerDigest: String
+                    if layer.hasSuffix("/layer.tar") {
+                        // Classic format: "<digest>/layer.tar"
+                        layerDigest = layer.replacingOccurrences(of: "/layer.tar", with: "")
+                    } else if layer.hasPrefix("blobs/sha256/") {
+                        // BuildKit format: "blobs/sha256/<digest>"
+                        layerDigest = String(layer.dropFirst("blobs/sha256/".count))
+                    } else {
+                        // Fallback: use as-is
+                        layerDigest = layer
+                    }
+
                     let layerSrcPath = dockerFormatPath.appendingPathComponent(layer)
                     let layerDstPath = blobsDir.appendingPathComponent(layerDigest)
 

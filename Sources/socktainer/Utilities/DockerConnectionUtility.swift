@@ -257,19 +257,10 @@ extension ConnectionHijackingMiddleware {
         streamHandler: @escaping @Sendable (AsyncThrowingStream<ByteBuffer, Error>.Continuation) async throws -> Void
     ) -> Response {
 
-        let connectionHeader = request.headers.first(name: "Connection")?.lowercased()
-        let upgradeHeader = request.headers.first(name: "Upgrade")?.lowercased()
-        let shouldUpgrade = connectionHeader?.contains("upgrade") == true && upgradeHeader == "tcp"
-
         let contentType = ttyEnabled ? "application/vnd.docker.raw-stream" : "application/vnd.docker.multiplexed-stream"
 
         var headers: HTTPHeaders = [:]
-        if shouldUpgrade {
-            headers.add(name: "Connection", value: "Upgrade")
-            headers.add(name: "Upgrade", value: "tcp")
-        } else {
-            headers.add(name: "Content-Type", value: contentType)
-        }
+        headers.add(name: "Content-Type", value: contentType)
 
         let body = Response.Body(stream: { writer in
             let (stream, continuation) = AsyncThrowingStream<ByteBuffer, Error>.makeStream()
@@ -295,8 +286,9 @@ extension ConnectionHijackingMiddleware {
             }
         })
 
-        let status: HTTPStatus = shouldUpgrade ? .switchingProtocols : .ok
-        return Response(status: status, headers: headers, body: body)
+        // Always use 200 OK for HTTP streaming responses.
+        // True TCP upgrades (101) use Response.dockerTCPUpgrade with a proper NIO upgrader.
+        return Response(status: .ok, headers: headers, body: body)
     }
 }
 

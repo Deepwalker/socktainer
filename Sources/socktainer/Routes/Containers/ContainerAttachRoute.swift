@@ -25,29 +25,11 @@ struct ContainerAttachRoute: RouteCollection {
 extension ContainerAttachRoute {
     static func handler(client: ClientContainerProtocol) -> @Sendable (Request) async throws -> Response {
         { req in
-            // TODO: This should be refactored to some generic implementation that is shared
-            //       with /containers/{id}/exec route.
-            let connectionHeader = req.headers.first(name: "Connection")?.lowercased()
-            let upgradeHeader = req.headers.first(name: "Upgrade")?.lowercased()
-            let shouldUpgradeToTCP = connectionHeader?.contains("upgrade") == true && upgradeHeader == "tcp"
-
-            let response = try await handleAttachRequest(req: req, client: client)
-
-            // If client requested upgrade and handler returned OK,
-            // convert to 101 Switching Protocols
-            if shouldUpgradeToTCP && response.status == .ok {
-                var hijackedHeaders: HTTPHeaders = [:]
-                hijackedHeaders.add(name: "Connection", value: "Upgrade")
-                hijackedHeaders.add(name: "Upgrade", value: "tcp")
-
-                return Response(
-                    status: .switchingProtocols,
-                    headers: hijackedHeaders,
-                    body: response.body
-                )
-            }
-
-            return response
+            // Each inner path handles its own upgrade mechanism:
+            // - non-stdin: always HTTP streaming (200 OK)
+            // - stdin with upgrade: Response.dockerTCPUpgrade (proper 101)
+            // - stdin without upgrade: createDockerStreamingResponse (200 OK)
+            return try await handleAttachRequest(req: req, client: client)
         }
     }
 
@@ -102,125 +84,134 @@ extension ContainerAttachRoute {
             )
         }
 
-        // Set appropriate content type based on TTY mode
-        let contentType = isTTY ? "application/vnd.docker.raw-stream" : "application/vnd.docker.multiplexed-stream"
+        let shouldUpgrade = isUpgrade && hasConnectionUpgrade
 
-        var headers = HTTPHeaders()
-        headers.add(name: "Content-Type", value: contentType)
+        // Docker CLI sends Connection: Upgrade for attach and expects 101 before
+        // proceeding to /start. We must use a proper NIO TCP upgrade (not just
+        // set status to 101 on a streaming body).
+        guard shouldUpgrade else {
+            // Fallback HTTP streaming for clients that don't request upgrade
+            let contentType = isTTY ? "application/vnd.docker.raw-stream" : "application/vnd.docker.multiplexed-stream"
+            var headers = HTTPHeaders()
+            headers.add(name: "Content-Type", value: contentType)
 
-        if isUpgrade && hasConnectionUpgrade {
-            headers.add(name: "Connection", value: "Upgrade")
-            headers.add(name: "Upgrade", value: "tcp")
-        }
-
-        // Create streaming response body using container logs when not using stdin
-        let body = Response.Body { writer in
-            Task.detached {
-                let pollInterval: UInt64 = 200_000_000  // 200ms
-                var containerWasRunning = false
-
-                defer {
-                    _ = writer.write(.end)
-                }
-
-                // Continuously poll for log handles and send data
-                while true {
-                    // Check if container still exists
-                    do {
-                        _ = try await client.getContainer(id: id)
-                    } catch {
-                        break
-                    }
-
-                    var logHandles: [FileHandle] = []
-                    var hasValidHandles = false
-
-                    // Try to get log handles
-                    do {
-                        logHandles = try await ContainerClient().logs(id: container.id)
-                        hasValidHandles = !logHandles.isEmpty
-                    } catch {
-                        hasValidHandles = false
-                    }
-
-                    defer {
-                        for handle in logHandles {
-                            try? handle.close()
-                        }
-                    }
-
-                    if hasValidHandles {
-                        let shouldAttachStdout = stdout || (!stdout && !stderr)
-                        var consecutiveEmptyReads = 0
-                        let maxEmptyReads = 50  // Switch to polling after 100 empty reads
-                        while true {
-                            // Check if container still exists before reading data
-                            do {
-                                let currentContainer = try await client.getContainer(id: id)
-                                guard let container = currentContainer else {
-                                    return
-                                }
-                                if container.status == .running {
-                                    containerWasRunning = true
-                                } else if containerWasRunning {
-                                    // Container was running but now stopped - exit
-                                    return
-                                }
-                            } catch {
-                                // Container not available, exit
-                                return
-                            }
-
-                            var hasData = false
-
-                            if shouldAttachStdout && logHandles.indices.contains(0) {
-                                let stdoutData = logHandles[0].availableData
-                                if !stdoutData.isEmpty {
-                                    hasData = true
-                                    let capacity = min(stdoutData.count + (isTTY ? 0 : 8), 65536)
-                                    var buffer = sharedAllocator.buffer(capacity: capacity)
-                                    buffer.writeDockerFrame(streamType: .stdout, data: stdoutData, ttyMode: isTTY)
-                                    _ = writer.write(.buffer(buffer))
-                                }
-                            }
-
-                            if !hasData {
-                                consecutiveEmptyReads += 1
-
-                                // After many empty reads, send keep-alive less frequently
-                                if consecutiveEmptyReads >= maxEmptyReads {
-                                    consecutiveEmptyReads = 0  // Reset counter
-                                    try await Task.sleep(nanoseconds: 500_000_000)  // 500ms
-                                } else {
-                                    try await Task.sleep(nanoseconds: 50_000_000)  // 50ms
-                                }
-                            } else {
-                                consecutiveEmptyReads = 0
-                                try await Task.sleep(nanoseconds: 5_000_000)  // 5ms when active
-                            }
-                        }
-
-                    } else {
-                        // No valid handles, just wait
-                        try await Task.sleep(nanoseconds: pollInterval)
-                    }
-
-                    do {
-                        try await Task.sleep(nanoseconds: pollInterval)
-                    } catch {
-                        break
+            let body = Response.Body { writer in
+                Task.detached {
+                    defer { _ = writer.write(.end) }
+                    await Self.pollContainerLogs(
+                        client: client, containerId: container.id,
+                        stdout: stdout, stderr: stderr, isTTY: isTTY
+                    ) { data, streamType in
+                        var buffer = sharedAllocator.buffer(capacity: min(data.count + 8, 65536))
+                        buffer.writeDockerFrame(streamType: streamType, data: data, ttyMode: isTTY)
+                        _ = writer.write(.buffer(buffer))
                     }
                 }
             }
+            return Response(status: .ok, headers: headers, body: body)
         }
 
-        let status: HTTPResponseStatus = (isUpgrade && hasConnectionUpgrade) ? .switchingProtocols : .ok
+        // Proper NIO TCP upgrade — Docker CLI gets 101 and can proceed to /start
+        return Response.dockerTCPUpgrade(
+            execId: container.id,
+            ttyEnabled: isTTY
+        ) { channel, _ in
+            await Self.pollContainerLogs(
+                client: client, containerId: container.id,
+                stdout: stdout, stderr: stderr, isTTY: isTTY
+            ) { data, streamType in
+                guard channel.isActive else { return }
+                channel.eventLoop.execute {
+                    var buffer = channel.allocator.buffer(capacity: min(data.count + 8, 65536))
+                    buffer.writeDockerFrame(streamType: streamType, data: data, ttyMode: isTTY)
+                    _ = channel.writeAndFlush(buffer)
+                }
+            }
 
-        return Response(
-            status: status,
-            headers: headers,
-            body: body
-        )
+            // Close channel when done
+            if channel.isActive {
+                _ = channel.eventLoop.submit { channel.close(promise: nil) }
+            }
+        }
+    }
+
+    /// Polls container log handles and calls `emit` with data chunks.
+    /// Returns when the container has stopped (after running) or is removed.
+    private static func pollContainerLogs(
+        client: ClientContainerProtocol,
+        containerId: String,
+        stdout: Bool,
+        stderr: Bool,
+        isTTY: Bool,
+        emit: @Sendable (Data, DockerStreamFrame.StreamType) -> Void
+    ) async {
+        let pollInterval: UInt64 = 200_000_000  // 200ms
+        var containerWasRunning = false
+        let shouldAttachStdout = stdout || (!stdout && !stderr)
+
+        while true {
+            // Check if container still exists
+            do {
+                guard let container = try await client.getContainer(id: containerId) else { break }
+                if container.status == .running {
+                    containerWasRunning = true
+                } else if containerWasRunning {
+                    break  // Container finished
+                }
+            } catch {
+                break
+            }
+
+            // Try to get log handles
+            var logHandles: [FileHandle] = []
+            do {
+                logHandles = try await ContainerClient().logs(id: containerId)
+            } catch {}
+
+            defer {
+                for handle in logHandles { try? handle.close() }
+            }
+
+            guard !logHandles.isEmpty else {
+                try? await Task.sleep(nanoseconds: pollInterval)
+                continue
+            }
+
+            // Read available data from handles
+            var consecutiveEmptyReads = 0
+            while true {
+                do {
+                    guard let container = try await client.getContainer(id: containerId) else { return }
+                    if container.status == .running {
+                        containerWasRunning = true
+                    } else if containerWasRunning {
+                        return
+                    }
+                } catch {
+                    return
+                }
+
+                var hasData = false
+
+                if shouldAttachStdout, logHandles.indices.contains(0) {
+                    let data = logHandles[0].availableData
+                    if !data.isEmpty {
+                        hasData = true
+                        emit(data, .stdout)
+                    }
+                }
+
+                if !hasData {
+                    consecutiveEmptyReads += 1
+                    let delay: UInt64 = consecutiveEmptyReads >= 50 ? 500_000_000 : 50_000_000
+                    if consecutiveEmptyReads >= 50 { consecutiveEmptyReads = 0 }
+                    try? await Task.sleep(nanoseconds: delay)
+                } else {
+                    consecutiveEmptyReads = 0
+                    try? await Task.sleep(nanoseconds: 5_000_000)
+                }
+            }
+        }
     }
 
     private static func handleAttachWithStdin(

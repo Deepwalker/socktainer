@@ -15,6 +15,8 @@ actor ExecManager {
         let attachStderr: Bool
         let tty: Bool
         let detach: Bool
+        var running: Bool = false
+        var exitCode: Int? = nil
     }
 
     private var storage: [String: ExecConfig] = [:]
@@ -29,8 +31,13 @@ actor ExecManager {
         storage[id]
     }
 
-    func remove(id: String) {
-        storage.removeValue(forKey: id)
+    func markRunning(id: String) {
+        storage[id]?.running = true
+    }
+
+    func markCompleted(id: String, exitCode: Int32) {
+        storage[id]?.running = false
+        storage[id]?.exitCode = Int(exitCode)
     }
 }
 
@@ -102,12 +109,10 @@ struct ExecRoute: RouteCollection {
                 }
             }
 
-            // For simplicity, we'll assume the exec is not running if we can inspect it
-            // In a real implementation, you'd track the actual process state
             let response = ExecInspectResponse(
                 ID: execId,
-                Running: false,  // We'd need to track this properly
-                ExitCode: nil,  // We'd need to track this from the actual process
+                Running: config.running,
+                ExitCode: config.exitCode,
                 ProcessConfig: ExecInspectResponse.ProcessConfigInfo(
                     privileged: false,
                     user: "",
@@ -198,6 +203,8 @@ struct ExecRoute: RouteCollection {
             let tty = startRequest.Tty ?? config.tty
             let _ = startRequest.ConsoleSize
 
+            req.logger.info("exec/start execId=\(execId) cmd=\(config.cmd) attachStdin=\(config.attachStdin) attachStdout=\(config.attachStdout) attachStderr=\(config.attachStderr) tty=\(tty) detach=\(detach)")
+
             // Detached mode
             if detach {
                 let executable = config.cmd.first!
@@ -214,7 +221,7 @@ struct ExecRoute: RouteCollection {
                     stdio: [nil, nil, nil]
                 )
                 try await process.start()
-                await ExecManager.shared.remove(id: execId)
+                await ExecManager.shared.markRunning(id: execId)
                 return Response(status: .ok)
             }
 
@@ -223,7 +230,10 @@ struct ExecRoute: RouteCollection {
             let upgradeHeader = req.headers.first(name: "Upgrade")?.lowercased()
             let shouldUpgrade = connectionHeader?.contains("upgrade") == true && upgradeHeader == "tcp" && config.attachStdin
 
+            req.logger.info("exec/start Connection=\(connectionHeader ?? "nil") Upgrade=\(upgradeHeader ?? "nil") shouldUpgrade=\(shouldUpgrade)")
+
             guard shouldUpgrade else {
+                req.logger.info("exec/start taking HTTP streaming fallback path")
                 // Fallback to HTTP streaming mode
                 return ConnectionHijackingMiddleware.createDockerStreamingResponse(
                     request: req,
@@ -256,6 +266,8 @@ struct ExecRoute: RouteCollection {
                     )
 
                     try await process.start()
+                    await ExecManager.shared.markRunning(id: execId)
+                    req.logger.info("exec/start [HTTP] process started for \(config.cmd)")
 
                     await withTaskGroup(of: Void.self) { group in
                         // stdout handler
@@ -331,8 +343,10 @@ struct ExecRoute: RouteCollection {
                         }
 
                         // Process monitor
+                        // Process monitor
                         group.addTask {
                             defer {
+                                req.logger.info("exec/start [HTTP] process monitor: closing pipes")
                                 // Close all write ends to signal EOF
                                 try? stdoutPipe?.fileHandleForWriting.close()
                                 try? stderrPipe?.fileHandleForWriting.close()
@@ -340,19 +354,24 @@ struct ExecRoute: RouteCollection {
                             }
 
                             do {
-                                let _ = try await process.wait()
+                                let exitCode = try await process.wait()
+                                req.logger.info("exec/start [HTTP] process exited with code \(exitCode)")
+                                await ExecManager.shared.markCompleted(id: execId, exitCode: exitCode)
                             } catch {
+                                req.logger.error("exec/start [HTTP] process wait error: \(error)")
+                                await ExecManager.shared.markCompleted(id: execId, exitCode: -1)
                             }
                         }
 
                         for await _ in group {}
                     }
 
-                    await ExecManager.shared.remove(id: execId)
+                    req.logger.info("exec/start [HTTP] all tasks done, finishing stream")
                     streamContinuation.finish()
                 }
             }
             // Use Docker TCP upgrader for true connection hijacking
+            req.logger.info("exec/start taking TCP upgrade path")
 
             return Response.dockerTCPUpgrade(
                 execId: execId,
@@ -391,32 +410,26 @@ struct ExecRoute: RouteCollection {
                 )
 
                 try await process.start()
+                await ExecManager.shared.markRunning(id: execId)
+                req.logger.info("exec/start [TCP] process started for \(config.cmd), channel.isActive=\(channel.isActive)")
 
                 // Setup bidirectional communication for interactive sessions
                 await withTaskGroup(of: Void.self) { group in
                     // stdout/stderr -> channel (container output to client)
                     if let stdoutHandle = stdoutPipe?.fileHandleForReading {
                         group.addTask {
-                            defer {
-                                try? stdoutHandle.close()
-                            }
-
                             let dispatchIO = DispatchIO(
                                 type: .stream,
                                 fileDescriptor: stdoutHandle.fileDescriptor,
                                 queue: DispatchQueue.global(qos: .userInteractive)
                             ) { error in
-                            }
-
-                            defer {
-                                dispatchIO.close()
+                                // Cleanup handler — safe to close FD here, after DispatchIO is fully done
+                                try? stdoutHandle.close()
                             }
 
                             // Set up for streaming
                             dispatchIO.setLimit(lowWater: 1)
                             dispatchIO.setLimit(highWater: 4096)
-
-                            let state = DockerConnectionState()
 
                             // Use a single read operation that processes all available data
                             await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
@@ -428,6 +441,7 @@ struct ExecRoute: RouteCollection {
                                     defer { completionLock.unlock() }
                                     guard !hasCompleted else { return }
                                     hasCompleted = true
+                                    dispatchIO.close()
                                     continuation.resume()
                                 }
 
@@ -455,7 +469,7 @@ struct ExecRoute: RouteCollection {
                                         }
                                     }
 
-                                    if done || error != 0 || !channel.isActive || state.shouldStop() {
+                                    if done || error != 0 || !channel.isActive {
                                         safeComplete()
                                     }
                                 }
@@ -465,27 +479,18 @@ struct ExecRoute: RouteCollection {
 
                     if let stderrHandle = stderrPipe?.fileHandleForReading {
                         group.addTask {
-                            defer {
-                                try? stderrHandle.close()
-                            }
-
                             let dispatchIO = DispatchIO(
                                 type: .stream,
                                 fileDescriptor: stderrHandle.fileDescriptor,
                                 queue: DispatchQueue.global(qos: .userInteractive)
                             ) { error in
-                                // Cleanup handled automatically
-                            }
-
-                            defer {
-                                dispatchIO.close()
+                                // Cleanup handler — safe to close FD here, after DispatchIO is fully done
+                                try? stderrHandle.close()
                             }
 
                             // Set up for streaming
                             dispatchIO.setLimit(lowWater: 1)
                             dispatchIO.setLimit(highWater: 1024)
-
-                            let state = DockerConnectionState()
 
                             await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
                                 var hasCompleted = false
@@ -496,6 +501,7 @@ struct ExecRoute: RouteCollection {
                                     defer { completionLock.unlock() }
                                     guard !hasCompleted else { return }
                                     hasCompleted = true
+                                    dispatchIO.close()
                                     continuation.resume()
                                 }
 
@@ -519,7 +525,7 @@ struct ExecRoute: RouteCollection {
                                         }
                                     }
 
-                                    if done || error != 0 || !channel.isActive || state.shouldStop() {
+                                    if done || error != 0 || !channel.isActive {
                                         safeComplete()
                                     }
                                 }
@@ -527,27 +533,21 @@ struct ExecRoute: RouteCollection {
                         }
                     }
 
-                    // Connection monitor to handle client disconnection
-                    group.addTask {
-                        // Monitor channel for closure - simplified approach
-                        while channel.isActive {
-                            try? await Task.sleep(nanoseconds: 100_000_000)  // 100ms
-                        }
-
-                        // Connection was closed - the process monitor will handle cleanup
-                    }
-
                     // Process monitor with proper cleanup
                     group.addTask {
                         do {
-                            let _ = try await process.wait()
+                            let exitCode = try await process.wait()
+                            req.logger.info("exec/start [TCP] process exited with code \(exitCode)")
+                            await ExecManager.shared.markCompleted(id: execId, exitCode: exitCode)
                         } catch {
-                            // Process wait error - handle gracefully
+                            req.logger.error("exec/start [TCP] process wait error: \(error)")
+                            await ExecManager.shared.markCompleted(id: execId, exitCode: -1)
                         }
 
                         // Give a small delay for any final output to be processed
                         try? await Task.sleep(nanoseconds: 100_000_000)  // 100ms
 
+                        req.logger.info("exec/start [TCP] closing pipes and channel")
                         // Close all pipes to signal EOF to readers
                         try? stdoutPipe?.fileHandleForWriting.close()
                         try? stderrPipe?.fileHandleForWriting.close()
@@ -562,7 +562,7 @@ struct ExecRoute: RouteCollection {
                     for await _ in group {}
                 }
 
-                await ExecManager.shared.remove(id: execId)
+                req.logger.info("exec/start [TCP] all tasks done")
             }
         }
     }

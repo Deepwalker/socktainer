@@ -135,8 +135,14 @@ struct ClientContainerService: ClientContainerProtocol {
 
     func getContainer(id: String) async throws -> ContainerSnapshot? {
         do {
+            // Try exact match first
             return try await containerClient.get(id: id)
         } catch let error as ContainerizationError where error.code == .notFound {
+            // If not found by exact ID, try prefix match (short ID support)
+            let allContainers = try await containerClient.list()
+            if let container = allContainers.first(where: { $0.id.hasPrefix(id) }) {
+                return container
+            }
             return nil
         }
     }

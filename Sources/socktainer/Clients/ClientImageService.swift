@@ -437,7 +437,12 @@ struct ClientImageService: ClientImageProtocol {
             })
 
         for image in loadedImages {
-            logger.info("Loaded image: \(image)")
+            logger.info("Loaded image tag from manifest: \(image)")
+        }
+
+        // Log the actual references that Apple Container assigned to these images
+        for image in images {
+            logger.info("Apple Container image reference: \(image.reference)")
         }
 
         logger.info("Successfully loaded \(images.count) image(s) from tarball")
