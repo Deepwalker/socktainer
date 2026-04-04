@@ -3,6 +3,27 @@ import BuildInfo
 import Foundation
 import Vapor
 
+struct DefaultContainerMemoryKey: StorageKey {
+    typealias Value = UInt64
+}
+
+func parseMemoryString(_ s: String) -> UInt64 {
+    let lowered = s.lowercased().trimmingCharacters(in: .whitespaces)
+    let multipliers: [(String, UInt64)] = [
+        ("g", 1024 * 1024 * 1024),
+        ("gb", 1024 * 1024 * 1024),
+        ("m", 1024 * 1024),
+        ("mb", 1024 * 1024),
+    ]
+    for (suffix, mult) in multipliers {
+        if lowered.hasSuffix(suffix), let n = UInt64(lowered.dropLast(suffix.count)) {
+            return n * mult
+        }
+    }
+    // Assume bytes if just a number
+    return UInt64(lowered) ?? (4 * 1024 * 1024 * 1024)
+}
+
 // CLI options
 struct CLIOptions: ParsableArguments {
     @ArgumentParser.Flag(name: .long, help: "Show version")
@@ -10,6 +31,9 @@ struct CLIOptions: ParsableArguments {
 
     @ArgumentParser.Flag(name: .long, inversion: .prefixedNo, help: "Check Apple Container compatibility and exit")
     var checkCompatibility: Bool = true
+
+    @ArgumentParser.Option(name: .long, help: "Default container memory limit (e.g. 4g, 2048m). Default: 4g")
+    var memory: String = "4g"
 }
 
 // Parse CLI before starting the app
@@ -32,8 +56,12 @@ let vaporArgs = [executable, "serve"]
 var env = try Environment.detect(arguments: vaporArgs)
 try LoggingSystem.bootstrap(from: &env)
 
+// Parse memory limit
+let defaultMemoryBytes = parseMemoryString(options.memory)
+
 // Create and configure the Vapor application
 let app = try await Application.make(env)
+app.storage[DefaultContainerMemoryKey.self] = defaultMemoryBytes
 try prepareUnixSocket(for: app, homeDirectory: ProcessInfo.processInfo.environment["HOME"])
 try await configure(app)
 
