@@ -103,7 +103,15 @@ extension BuildRoute {
                 throw Abort(.serviceUnavailable, reason: "BuildKit builder is not running or reachable: \(error.localizedDescription)")
             }
 
-            // Extract tar archive from request body and unpack to temporary directory
+            let perfClock = ContinuousClock()
+            let perfStart = perfClock.now
+            func perfMs() -> Int64 {
+                let d = perfClock.now - perfStart
+                return d.components.seconds * 1000 + Int64(d.components.attoseconds / 1_000_000_000_000_000)
+            }
+
+            req.logger.info("[build-perf] \(perfMs())ms ensureReachable done")
+
             let contextDir: String
             let buildUUID = UUID().uuidString
             let appSupportDir = try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: false)
@@ -111,100 +119,123 @@ extension BuildRoute {
             let tempContextDir = appSupportDir.appendingPathComponent(buildUUID)
 
             do {
-                // Create temporary directory for build context
                 try FileManager.default.createDirectory(at: tempContextDir, withIntermediateDirectories: true, attributes: nil)
 
-                // Check if we have a request body to process
-                let hasBody = req.body.data != nil || req.headers.first(name: "transfer-encoding")?.lowercased() == "chunked"
+                let hasBody = req.body.data != nil
+                    || req.headers.first(name: "transfer-encoding")?.lowercased() == "chunked"
+                    || (req.headers.first(name: "content-length").flatMap(Int.init) ?? 0) > 0
 
                 if hasBody {
-
-                    // Write the body data to a temporary tar file using streaming
                     let tarPath = tempContextDir.appendingPathComponent("context.tar")
-                    var fileHandle: FileHandle?
                     var totalBytesWritten = 0
 
-                    do {
-                        // Create the tar file and open file handle for writing
-                        FileManager.default.createFile(atPath: tarPath.path, contents: nil)
-                        fileHandle = try FileHandle(forWritingTo: tarPath)
-
-                        // Stream the body directly to the tar file without loading into memory
-                        if let bodyData = req.body.data {
-                            // Direct body data available
-                            let data = Data(buffer: bodyData)
-                            try fileHandle?.write(contentsOf: data)
-                            totalBytesWritten = data.count
-                        } else {
-                            var chunkCount = 0
-                            for try await var chunk in req.body {
-                                guard let data = chunk.readData(length: chunk.readableBytes) else {
-                                    continue
-                                }
-                                chunkCount += 1
-                                try fileHandle?.write(contentsOf: data)
-                                totalBytesWritten += data.count
-                            }
-                        }
-
-                        try fileHandle?.synchronize()
-                        try fileHandle?.close()
-                        fileHandle = nil
-                    } catch {
-                        // Clean up file handle and partial tar file on error
-                        try? fileHandle?.close()
-                        try? FileManager.default.removeItem(at: tarPath)
-                        req.logger.error("Failed to stream body to tar file: \(error)")
-                        throw Abort(.badRequest, reason: "Failed to process request body: \(error.localizedDescription)")
+                    // Write body to tar file
+                    let fd = open(tarPath.path, O_WRONLY | O_CREAT | O_TRUNC, 0o644)
+                    guard fd >= 0 else {
+                        throw Abort(.internalServerError, reason: "Failed to create tar file")
                     }
 
-                    if totalBytesWritten > 0 {
-                        guard FileManager.default.fileExists(atPath: tarPath.path),
-                            let fileAttributes = try? FileManager.default.attributesOfItem(atPath: tarPath.path),
-                            let fileSize = fileAttributes[.size] as? Int64,
-                            fileSize > 0
-                        else {
-                            req.logger.error("Tar file is missing or empty after writing \(totalBytesWritten) bytes")
-                            throw Abort(.badRequest, reason: "Failed to write tar archive to disk")
+                    do {
+                        if let bodyData = req.body.data {
+                            bodyData.withUnsafeReadableBytes { ptr in
+                                guard let base = ptr.baseAddress else { return }
+                                var remaining = ptr.count
+                                var offset = 0
+                                while remaining > 0 {
+                                    let n = Darwin.write(fd, base + offset, remaining)
+                                    if n < 0 { if errno == EINTR { continue }; break }
+                                    if n == 0 { break }
+                                    offset += n
+                                    remaining -= n
+                                }
+                                totalBytesWritten = offset
+                            }
+                        } else {
+                            for try await chunk in req.body {
+                                let ok = chunk.withUnsafeReadableBytes { ptr -> Bool in
+                                    guard let base = ptr.baseAddress else { return true }
+                                    var remaining = ptr.count
+                                    var offset = 0
+                                    while remaining > 0 {
+                                        let n = Darwin.write(fd, base + offset, remaining)
+                                        if n < 0 { if errno == EINTR { continue }; return false }
+                                        if n == 0 { return false }
+                                        offset += n
+                                        remaining -= n
+                                    }
+                                    totalBytesWritten += ptr.count
+                                    return true
+                                }
+                                if !ok { break }
+                            }
                         }
+                        close(fd)
+                    } catch {
+                        close(fd)
+                        throw Abort(.badRequest, reason: "Failed reading request body: \(error.localizedDescription)")
+                    }
 
-                        // Extract the tar archive
+                    req.logger.info("[build-perf] \(perfMs())ms body received (\(totalBytesWritten) bytes)")
+
+                    if totalBytesWritten > 0 {
                         let extractDir = tempContextDir.appendingPathComponent("context")
                         try FileManager.default.createDirectory(at: extractDir, withIntermediateDirectories: true, attributes: nil)
 
-                        do {
-                            try ArchiveUtility.extract(tarPath: tarPath, to: extractDir)
-                        } catch {
-                            req.logger.error("Tar extraction failed: \(error)")
+                        // macOS bsdtar auto-detects gzip/plain tar via libarchive — no need to check Content-Type
+                        let extractProc = Process()
+                        let stderrPipe = Pipe()
 
-                            throw Abort(.badRequest, reason: "Failed to extract tar archive: \(error.localizedDescription)")
+                        extractProc.executableURL = URL(fileURLWithPath: "/usr/bin/tar")
+                        extractProc.arguments = ["xf", tarPath.path, "-C", extractDir.path]
+
+                        extractProc.standardOutput = FileHandle.nullDevice
+                        extractProc.standardError = stderrPipe
+                        try extractProc.run()
+                        extractProc.waitUntilExit()
+                        let stderrText = String(data: stderrPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+
+                        req.logger.info("[build-perf] \(perfMs())ms tar extracted")
+
+                        if extractProc.terminationStatus > 1 {
+                            // exit >1 = fatal; exit 1 = warning (missing tar padding/EOF — safe to ignore)
+                            let debugCopy = "/tmp/socktainer-debug-\(buildUUID).tar"
+                            try? FileManager.default.copyItem(atPath: tarPath.path, toPath: debugCopy)
+                            req.logger.error("tar extraction failed, debug copy: \(debugCopy)")
+                            throw Abort(.badRequest, reason: "tar extraction failed (exit \(extractProc.terminationStatus)): \(stderrText)")
                         }
+
+                        try? FileManager.default.removeItem(at: tarPath)
                         contextDir = extractDir.path
                     } else {
                         req.logger.warning("No data received in request body")
                         contextDir = "."
                     }
                 } else {
-                    // No body provided, use current directory as fallback
-                    req.logger.warning("No build context provided in request body, using current directory as fallback")
+                    req.logger.warning("No build context provided in request body")
                     contextDir = "."
                 }
             } catch {
-                // Clean up on error
                 try? FileManager.default.removeItem(at: tempContextDir)
                 throw error
             }
 
-            // Parse build arguments
+            // Parse build arguments — Docker API sends JSON: {"KEY":"VALUE",...}
+            // BuildKit expects ["KEY=VALUE", ...]
             let buildArgs: [String] = {
-                guard let buildArgsString = query.buildargs else { return [] }
-                return buildArgsString.split(separator: ",").map(String.init)
+                guard let buildArgsString = query.buildargs,
+                      let data = buildArgsString.data(using: .utf8),
+                      let dict = try? JSONSerialization.jsonObject(with: data) as? [String: String]
+                else { return [] }
+                return dict.map { "\($0.key)=\($0.value)" }
             }()
 
-            // Parse labels
+            // Parse labels — same JSON format
             let labels: [String] = {
-                guard let labelsString = query.labels else { return [] }
-                return labelsString.split(separator: ",").map(String.init)
+                guard let labelsString = query.labels,
+                      let data = labelsString.data(using: .utf8),
+                      let dict = try? JSONSerialization.jsonObject(with: data) as? [String: String]
+                else { return [] }
+                return dict.map { "\($0.key)=\($0.value)" }
             }()
 
             // Create streaming response for build output
@@ -338,46 +369,46 @@ extension BuildRoute {
             }
         }
 
-        // Send initial build started message
+        let buildClock = ContinuousClock()
+        let buildStart = buildClock.now
+
+        func elapsed() -> String {
+            let ms = (buildClock.now - buildStart).components.seconds * 1000
+                + Int64((buildClock.now - buildStart).components.attoseconds / 1_000_000_000_000_000)
+            return "\(ms)ms"
+        }
+
         sendStreamMessage("Step 1/1 : Starting build for \(targetImageName)")
 
         let timeout: Duration = .seconds(300)
 
-        sendStreamMessage(" ---> Connecting to build daemon")
-
+        logger.info("[build-perf] \(elapsed()) connecting to builder")
         let builder = try await builderClient.connect(
             timeout: timeout,
             retryInterval: .seconds(1),
             logger: logger
         )
-        sendStreamMessage(" ---> Successfully connected to builder")
+        logger.info("[build-perf] \(elapsed()) builder connected")
+        sendStreamMessage(" ---> Connected to builder (\(elapsed()))")
 
-        // resolve the full path to the Dockerfile
-        sendStreamMessage(" ---> Reading Dockerfile")
         let dockerfilePath = URL(fileURLWithPath: contextDir).appendingPathComponent(dockerfile).path
-        logger.info("Reading Dockerfile at path: \(dockerfilePath)")
 
         guard let dockerfileData = try? Data(contentsOf: URL(filePath: dockerfilePath)) else {
             throw ContainerizationError(.invalidArgument, message: "Dockerfile does not exist at path: \(dockerfilePath)")
         }
 
-        sendStreamMessage(" ---> Setting up build environment")
-
-        // Setup temp directory - must use the builder export path that's mounted in buildkit container
         let builderExportPath = try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: false)
             .appendingPathComponent("com.apple.container/builder")
         let buildID = UUID().uuidString
         let tempURL = builderExportPath.appendingPathComponent(buildID)
         try FileManager.default.createDirectory(at: tempURL, withIntermediateDirectories: true, attributes: nil)
 
-        // Validate and normalize image name
         let imageName: String = try {
             let parsedReference = try Reference.parse(targetImageName)
             parsedReference.normalize()
             return parsedReference.description
         }()
 
-        // Setup exports - use BuildCommand approach
         let exports: [Builder.BuildExport] = try ["type=oci"].map { output in
             var exp = try Builder.BuildExport(from: output)
             if exp.destination == nil {
@@ -386,7 +417,6 @@ extension BuildRoute {
             return exp
         }
 
-        // Parse platforms
         let platforms: Set<Platform> = {
             guard platform.isEmpty else {
                 return [try! Platform(from: platform)]
@@ -394,12 +424,10 @@ extension BuildRoute {
             return [try! Platform(from: "linux/\(Arch.hostArchitecture().rawValue)")]
         }()
 
-        // Build configuration
         let config = ContainerBuild.Builder.BuildConfig(
             buildID: buildID,
             contentStore: RemoteContentStoreClient(),
             buildArgs: buildArgs,
-            // TODO: Implement secrets once integration with buildkit materializes
             secrets: [:],
             contextDir: contextDir,
             dockerfile: dockerfileData,
@@ -407,7 +435,7 @@ extension BuildRoute {
             labels: labels,
             noCache: noCache,
             platforms: [Platform](platforms),
-            terminal: nil,  // No terminal for API
+            terminal: nil,
             tags: [imageName],
             target: target,
             quiet: quiet,
@@ -417,40 +445,30 @@ extension BuildRoute {
             pull: pull
         )
 
-        sendStreamMessage(" ---> Starting build process")
+        logger.info("[build-perf] \(elapsed()) starting builder.build()")
+        sendStreamMessage(" ---> Starting build (\(elapsed()))")
 
-        // Run build directly without output capture
         try await builder.build(config)
 
-        sendStreamMessage(" ---> Build process completed")
+        logger.info("[build-perf] \(elapsed()) builder.build() done")
+        sendStreamMessage(" ---> Build done (\(elapsed()))")
 
-        sendStreamMessage(" ---> Build completed, processing image")
-
-        // Load and unpack the built image
         let destPath = tempURL.appendingPathComponent("out.tar")
         guard FileManager.default.fileExists(atPath: destPath.path) else {
-            // List directory contents to help debug
-            logger.error("Output image not found at expected path: \(destPath.path)")
-            do {
-                let parentDir = tempURL.path
-                let contents = try FileManager.default.contentsOfDirectory(atPath: parentDir)
-                logger.error("Contents of export directory \(parentDir): \(contents)")
-            } catch {
-                logger.error("Could not list contents of export directory: \(error)")
-            }
+            logger.error("Output image not found at: \(destPath.path)")
             throw ContainerizationError(.unknown, message: "Build completed but no output image found at \(destPath.path)")
         }
-        sendStreamMessage(" ---> Loading built image")
 
+        logger.info("[build-perf] \(elapsed()) loading image")
         let loaded = try await ClientImage.load(from: destPath.absolutePath())
+        logger.info("[build-perf] \(elapsed()) image loaded, unpacking \(loaded.images.count) images")
 
         for image in loaded.images {
-            sendStreamMessage(" ---> Unpacking image layers")
             try await image.unpack(platform: nil, progressUpdate: { _ in })
         }
 
-        // Send success message in Docker API format
-        sendStreamMessage("Successfully built \(imageName)")
+        logger.info("[build-perf] \(elapsed()) unpack done")
+        sendStreamMessage("Successfully built \(imageName) (\(elapsed()) total)")
 
         _ = writer.write(.end)
     }

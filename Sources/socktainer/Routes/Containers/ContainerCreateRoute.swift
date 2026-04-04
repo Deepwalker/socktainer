@@ -221,36 +221,38 @@ extension ContainerCreateRoute {
                 containerConfiguration.rosetta = true
             }
 
-            // Handle hostname from request - ensure uniqueness to avoid collision
-            let hostname = (body.Hostname?.isEmpty == false) ? body.Hostname! : "\(id)-\(UUID().uuidString.lowercased())"
+            // Handle hostname: prefer explicit Hostname, then first alias from EndpointsConfig, then fallback
+            let defaultHostname = "\(id)-\(UUID().uuidString.lowercased())"
+            let explicitHostname = (body.Hostname?.isEmpty == false) ? body.Hostname : nil
 
             // Handle networking configuration from request
             if let networkingConfig = body.NetworkingConfig,
                 let endpointsConfig = networkingConfig.EndpointsConfig,
                 !endpointsConfig.isEmpty
             {
-                // Use networking config from request if provided
-                containerConfiguration.networks = endpointsConfig.map { (networkName, _) in
-                    let options = AttachmentOptions(hostname: hostname)
-                    return AttachmentConfiguration(network: networkName, options: options)
+                containerConfiguration.networks = endpointsConfig.map { (networkName, endpointSettings) in
+                    // Use explicit Hostname, or first alias (compose service name), or default
+                    let hostname = explicitHostname
+                        ?? endpointSettings.Aliases?.first
+                        ?? defaultHostname
+                    return AttachmentConfiguration(network: networkName, options: AttachmentOptions(hostname: hostname))
                 }
             } else if let networkingConfig = body.NetworkingConfig,
                 let networks = networkingConfig.Networks,
                 !networks.isEmpty
             {
-                // Fallback to Networks field for backward compatibility
+                let hostname = explicitHostname ?? defaultHostname
                 containerConfiguration.networks = networks.map { (networkName, _) in
-                    let options = AttachmentOptions(hostname: hostname)
-                    return AttachmentConfiguration(network: networkName, options: options)
+                    return AttachmentConfiguration(network: networkName, options: AttachmentOptions(hostname: hostname))
                 }
             } else if let hostConfig = body.HostConfig,
                 let networkMode = hostConfig.NetworkMode,
                 !networkMode.isEmpty
             {
-                // Use NetworkMode from HostConfig
+                let hostname = explicitHostname ?? defaultHostname
                 containerConfiguration.networks = [AttachmentConfiguration(network: networkMode, options: AttachmentOptions(hostname: hostname))]
             } else {
-                // Fall back to default network if no networking config provided
+                let hostname = explicitHostname ?? defaultHostname
                 containerConfiguration.networks = [AttachmentConfiguration(network: "default", options: AttachmentOptions(hostname: hostname))]
             }
 

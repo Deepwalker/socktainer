@@ -51,6 +51,7 @@ struct ClientBuilderService: ClientBuilderProtocol {
     private let builderCPUs: Int64
     private let builderMemory: String
     private let appSupportURL: URL
+    private let sharedEventLoopGroup: MultiThreadedEventLoopGroup
 
     init(
         builderContainerId: String = "buildkit",
@@ -64,6 +65,7 @@ struct ClientBuilderService: ClientBuilderProtocol {
         self.builderCPUs = builderCPUs
         self.builderMemory = builderMemory
         self.appSupportURL = appSupportURL
+        self.sharedEventLoopGroup = MultiThreadedEventLoopGroup(numberOfThreads: System.coreCount)
     }
 
     func prune(_ request: BuilderPruneRequest, logger: Logger) async throws -> BuilderPruneResult {
@@ -139,13 +141,11 @@ struct ClientBuilderService: ClientBuilderProtocol {
         while clock.now < deadline {
             do {
                 let socket = try await dialBuilderSocket()
-                let group = MultiThreadedEventLoopGroup(numberOfThreads: System.coreCount)
-                let builder = try Builder(socket: socket, group: group)
+                let builder = try Builder(socket: socket, group: sharedEventLoopGroup)
                 do {
                     _ = try await builder.info()
                     return builder
                 } catch {
-                    try? await group.shutdownGracefully()
                     throw error
                 }
             } catch {

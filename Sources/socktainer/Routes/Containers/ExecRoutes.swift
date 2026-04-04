@@ -15,6 +15,7 @@ actor ExecManager {
         let attachStderr: Bool
         let tty: Bool
         let detach: Bool
+        let user: String?
         var running: Bool = false
         var exitCode: Int? = nil
     }
@@ -48,6 +49,7 @@ struct CreateExecRequest: Content {
     let AttachStdout: Bool?
     let AttachStderr: Bool?
     let Tty: Bool?
+    let User: String?
 }
 
 struct CreateExecResponse: Content {
@@ -115,7 +117,7 @@ struct ExecRoute: RouteCollection {
                 ExitCode: config.exitCode,
                 ProcessConfig: ExecInspectResponse.ProcessConfigInfo(
                     privileged: false,
-                    user: "",
+                    user: config.user ?? "",
                     tty: config.tty,
                     entrypoint: config.cmd.first ?? "",
                     arguments: Array(config.cmd.dropFirst()),
@@ -167,7 +169,8 @@ struct ExecRoute: RouteCollection {
                 attachStdout: body.AttachStdout ?? true,
                 attachStderr: attachStderr,
                 tty: body.Tty ?? false,
-                detach: false
+                detach: false,
+                user: body.User
             )
 
             let id = await ExecManager.shared.create(config: config)
@@ -213,6 +216,9 @@ struct ExecRoute: RouteCollection {
                 processConfig.executable = executable
                 processConfig.arguments = arguments
                 processConfig.terminal = tty
+                if let user = config.user, !user.isEmpty {
+                    processConfig.user = .raw(userString: user)
+                }
 
                 let process = try await ContainerClient().createProcess(
                     containerId: container.id,
@@ -257,6 +263,9 @@ struct ExecRoute: RouteCollection {
                     processConfig.executable = executable
                     processConfig.arguments = arguments
                     processConfig.terminal = tty
+                    if let user = config.user, !user.isEmpty {
+                        processConfig.user = .raw(userString: user)
+                    }
 
                     let process = try await ContainerClient().createProcess(
                         containerId: container.id,
@@ -400,6 +409,9 @@ struct ExecRoute: RouteCollection {
                 processConfig.executable = executable
                 processConfig.arguments = arguments
                 processConfig.terminal = tty
+                if let user = config.user, !user.isEmpty {
+                    processConfig.user = .raw(userString: user)
+                }
 
                 req.logger.info("exec/start [TCP] creating process for \(config.cmd)")
                 let process = try await ContainerClient().createProcess(
