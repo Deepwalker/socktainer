@@ -192,7 +192,7 @@ struct ClientContainerService: ClientContainerProtocol {
 
         let signal = try parseSignal(signal ?? "SIGTERM")
 
-        let options = ContainerStopOptions(timeoutInSeconds: Int32(timeout ?? 5), signal: signal)
+        let options = ContainerStopOptions(timeoutInSeconds: Int32(max(timeout ?? 5, 1)), signal: signal)
         try await containerClient.stop(id: container.id, opts: options)
     }
 
@@ -244,18 +244,20 @@ struct ClientContainerService: ClientContainerProtocol {
         var exitCode: Int64 = 0
 
         switch condition {
-        // TODO: This condition needs to be re-implemented to properly handle container lifecycle
-        //       Currently stubbed to support `docker attach` workflows,
-        //       immediately return to prevent blocking `docker attach`
         case .notRunning:
-            // while container?.status == .running {
-            //     try await Task.sleep(nanoseconds: 500_000_000)  // 0.5 seconds
-            //     container = try await containerClient.list().first(where: { $0.id == id })
-            //     guard let container = container else {
-            //         break
-            //     }
-            // }
-            break
+            // Block until the container is not running.
+            // If already stopped — return immediately.
+            if initialContainer.status != .running {
+                break
+            }
+            // Container is running — poll until it stops
+            while true {
+                try await Task.sleep(nanoseconds: 500_000_000)  // 0.5 seconds
+                container = try await containerClient.list().first(where: { $0.id == id })
+                if container == nil || container?.status != .running {
+                    break
+                }
+            }
 
         case .nextExit:
             // Wait for next exit (only if currently running)

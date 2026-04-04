@@ -3,6 +3,52 @@ import NIOCore
 import NIOHTTP1
 import Vapor
 
+// MARK: - Safe pipe helpers
+// Uses raw pipe(2) + dup() to create fully independent fd copies.
+// Unlike Foundation's Pipe(), no auto-close on dealloc — all fds are explicitly managed.
+
+/// Pipe for process stdin: SDK reads from `forProcess`, we write to `forUsFd`.
+struct StdinPipe {
+    let forProcess: FileHandle  // closeOnDealloc: false — SDK owns it
+    let forUsFd: Int32          // raw fd — use Darwin.write(), caller closes
+}
+
+/// Pipe for process stdout/stderr: SDK writes to `forProcess`, we read from `forUs`.
+/// Close `forCleanup` to signal EOF to reader after process exits.
+struct OutputPipe {
+    let forProcess: FileHandle  // closeOnDealloc: false — SDK owns it
+    let forUs: FileHandle       // closeOnDealloc: true — our read handle
+    let forCleanup: Int32       // raw fd — close() to signal EOF
+}
+
+func makeStdinPipe() -> StdinPipe {
+    var fds = [Int32](repeating: -1, count: 2)
+    precondition(pipe(&fds) == 0, "pipe() failed")
+    let readCopy = dup(fds[0])
+    let writeCopy = dup(fds[1])
+    close(fds[0])
+    close(fds[1])
+    return StdinPipe(
+        forProcess: FileHandle(fileDescriptor: readCopy, closeOnDealloc: false),
+        forUsFd: writeCopy
+    )
+}
+
+func makeOutputPipe() -> OutputPipe {
+    var fds = [Int32](repeating: -1, count: 2)
+    precondition(pipe(&fds) == 0, "pipe() failed")
+    let readCopy = dup(fds[0])
+    let writeCopy1 = dup(fds[1])
+    let writeCopy2 = dup(fds[1])
+    close(fds[0])
+    close(fds[1])
+    return OutputPipe(
+        forProcess: FileHandle(fileDescriptor: writeCopy1, closeOnDealloc: false),
+        forUs: FileHandle(fileDescriptor: readCopy, closeOnDealloc: true),
+        forCleanup: writeCopy2
+    )
+}
+
 /// Thread-safe state management for Docker I/O operations to prevent race conditions
 public final class DockerConnectionState: @unchecked Sendable {
     private let lock = NSLock()
@@ -81,7 +127,10 @@ private struct DockerTCPProtocolUpgrader: HTTPServerProtocolUpgrader {
         let channel = context.channel
         let eventLoop = context.eventLoop
 
-        return context.pipeline.addHandler(tcpHandler).flatMap { _ in
+        // Allow remote half-closure so that when Docker CLI closes write-half
+        // (no stdin to send), we keep the channel open for stdout writes.
+        return channel.setOption(ChannelOptions.allowRemoteHalfClosure, value: true).flatMap {
+        context.pipeline.addHandler(tcpHandler).flatMap { _ in
             _ = Task.detached { [streamHandler] in
                 do {
                     try await streamHandler(channel, tcpHandler)
@@ -94,16 +143,21 @@ private struct DockerTCPProtocolUpgrader: HTTPServerProtocolUpgrader {
 
             return eventLoop.makeSucceededVoidFuture()
         }
+        }
     }
 }
 
-/// Channel handler that manages raw TCP communication after HTTP upgrade
+/// Channel handler that manages raw TCP communication after HTTP upgrade.
+/// Uses raw Darwin.write() instead of Foundation FileHandle to avoid ENOTSUP issues.
 public final class DockerTCPHandler: ChannelInboundHandler, @unchecked Sendable {
     public typealias InboundIn = ByteBuffer
 
     let execId: String
     let ttyEnabled: Bool
-    private var stdinWriter: FileHandle?
+    private let lock = NSLock()
+    private var stdinFd: Int32 = -1
+    private var pendingData: [Data] = []
+    private static let logger = Logger(label: "DockerTCPHandler")
 
     init(execId: String, ttyEnabled: Bool) {
         self.execId = execId
@@ -115,38 +169,87 @@ public final class DockerTCPHandler: ChannelInboundHandler, @unchecked Sendable 
 
     public func channelRead(context: ChannelHandlerContext, data: NIOAny) {
         let buffer = unwrapInboundIn(data)
+        guard let data = buffer.getData(at: 0, length: buffer.readableBytes) else { return }
 
-        // Handle raw TCP input from client (stdin)
-        // This data should be forwarded to the process stdin
-        if let stdinWriter = self.stdinWriter {
-            if let data = buffer.getData(at: 0, length: buffer.readableBytes) {
-                do {
-                    try stdinWriter.write(contentsOf: data)
-
-                    // Force flush the data to ensure it reaches the process
-                    try stdinWriter.synchronize()
-                } catch {
-                    // Failed to write to stdin
+        lock.lock()
+        let fd = stdinFd
+        if fd >= 0 {
+            lock.unlock()
+            data.withUnsafeBytes { ptr in
+                guard let base = ptr.baseAddress else { return }
+                var remaining = ptr.count
+                var offset = 0
+                while remaining > 0 {
+                    let written = Darwin.write(fd, base + offset, remaining)
+                    if written < 0 {
+                        Self.logger.error("[\(self.execId)] stdin write failed (\(data.count) bytes, fd=\(fd)): errno=\(errno)")
+                        break
+                    }
+                    if written == 0 { break }
+                    offset += written
+                    remaining -= written
                 }
-            } else {
-                // No buffer data available
             }
         } else {
-            // No stdin writer available
+            pendingData.append(data)
+            lock.unlock()
+        }
+    }
+
+    public func userInboundEventTriggered(context: ChannelHandlerContext, event: Any) {
+        if (event as? ChannelEvent) == .inputClosed {
+            Self.logger.info("[\(execId)] inputClosed — closing stdinFd")
+            lock.lock()
+            if stdinFd >= 0 { close(stdinFd) }
+            stdinFd = -1
+            lock.unlock()
+        } else {
+            context.fireUserInboundEventTriggered(event)
         }
     }
 
     public func errorCaught(context: ChannelHandlerContext, error: Error) {
+        Self.logger.error("[\(execId)] errorCaught: \(error)")
         context.close(promise: nil)
     }
 
     public func channelInactive(context: ChannelHandlerContext) {
-        try? stdinWriter?.close()
+        lock.lock()
+        if stdinFd >= 0 { close(stdinFd) }
+        stdinFd = -1
+        lock.unlock()
     }
 
-    // Method to set the stdin writer from the stream handler
-    public func setStdinWriter(_ writer: FileHandle?) {
-        self.stdinWriter = writer
+    /// Set the stdin fd. Pass -1 to clear (closes the fd).
+    public func setStdinFd(_ fd: Int32) {
+        lock.lock()
+        let oldFd = stdinFd
+        stdinFd = fd
+        let buffered = pendingData
+        pendingData = []
+        lock.unlock()
+
+        // Close old fd if it was valid
+        if oldFd >= 0 && oldFd != fd { close(oldFd) }
+
+        // Flush any data that arrived before the fd was set
+        if fd >= 0 {
+            for data in buffered {
+                let ok = data.withUnsafeBytes { ptr -> Bool in
+                    guard let base = ptr.baseAddress else { return true }
+                    var remaining = ptr.count
+                    var offset = 0
+                    while remaining > 0 {
+                        let written = Darwin.write(fd, base + offset, remaining)
+                        if written <= 0 { return false }
+                        offset += written
+                        remaining -= written
+                    }
+                    return true
+                }
+                if !ok { break }
+            }
+        }
     }
 }
 

@@ -36,11 +36,11 @@ extension EventsRoute {
                                 req.logger.debug("Client disconnected (closed channel)")
                                 break
                             } catch {
-                                // NOTE: Consider improving logging
                                 req.logger.warning("\(event) raised '\(error)'")
                             }
                         }
                     }
+                    try? await writer.write(.end)
                 }
             })
 

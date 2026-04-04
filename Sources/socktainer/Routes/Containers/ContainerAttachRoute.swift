@@ -86,11 +86,23 @@ extension ContainerAttachRoute {
 
         let shouldUpgrade = isUpgrade && hasConnectionUpgrade
 
-        // Docker CLI sends Connection: Upgrade for attach and expects 101 before
-        // proceeding to /start. We must use a proper NIO TCP upgrade (not just
-        // set status to 101 on a streaming body).
+        // For stopped containers, bootstrap with pipes so we capture all output
+        // regardless of how fast the container exits. The subsequent /start call
+        // will see the container is already running and no-op.
+        if container.status == .stopped {
+            return try await handleAttachWithoutStdin(
+                req: req,
+                client: client,
+                container: container,
+                stdout: stdout,
+                stderr: stderr,
+                shouldUpgrade: shouldUpgrade,
+                isTTY: isTTY
+            )
+        }
+
+        // For running containers, poll logs
         guard shouldUpgrade else {
-            // Fallback HTTP streaming for clients that don't request upgrade
             let contentType = isTTY ? "application/vnd.docker.raw-stream" : "application/vnd.docker.multiplexed-stream"
             var headers = HTTPHeaders()
             headers.add(name: "Content-Type", value: contentType)
@@ -111,7 +123,6 @@ extension ContainerAttachRoute {
             return Response(status: .ok, headers: headers, body: body)
         }
 
-        // Proper NIO TCP upgrade — Docker CLI gets 101 and can proceed to /start
         return Response.dockerTCPUpgrade(
             execId: container.id,
             ttyEnabled: isTTY
@@ -128,7 +139,6 @@ extension ContainerAttachRoute {
                 }
             }
 
-            // Close channel when done
             if channel.isActive {
                 _ = channel.eventLoop.submit { channel.close(promise: nil) }
             }
@@ -147,6 +157,7 @@ extension ContainerAttachRoute {
     ) async {
         let pollInterval: UInt64 = 200_000_000  // 200ms
         var containerWasRunning = false
+        var everReceivedData = false
         let shouldAttachStdout = stdout || (!stdout && !stderr)
 
         while true {
@@ -155,7 +166,7 @@ extension ContainerAttachRoute {
                 guard let container = try await client.getContainer(id: containerId) else { break }
                 if container.status == .running {
                     containerWasRunning = true
-                } else if containerWasRunning {
+                } else if containerWasRunning || everReceivedData {
                     break  // Container finished
                 }
             } catch {
@@ -184,7 +195,7 @@ extension ContainerAttachRoute {
                     guard let container = try await client.getContainer(id: containerId) else { return }
                     if container.status == .running {
                         containerWasRunning = true
-                    } else if containerWasRunning {
+                    } else if containerWasRunning || everReceivedData {
                         return
                     }
                 } catch {
@@ -197,6 +208,7 @@ extension ContainerAttachRoute {
                     let data = logHandles[0].availableData
                     if !data.isEmpty {
                         hasData = true
+                        everReceivedData = true
                         emit(data, .stdout)
                     }
                 }
@@ -261,15 +273,15 @@ extension ContainerAttachRoute {
         let attachStdout = query.stdout ?? true
         let attachStderr = query.stderr ?? !isTTY
 
-        // Create pipes for bidirectional communication with the main process
-        let stdinPipe: Pipe = Pipe()
-        let stdoutPipe: Pipe? = attachStdout ? Pipe() : nil
-        let stderrPipe: Pipe? = (attachStderr && !isTTY) ? Pipe() : nil
+        // Safe pipes: raw pipe(2) + dup() — no Foundation Pipe auto-close issues
+        let stdinPipe: StdinPipe = makeStdinPipe()
+        let stdoutPipe: OutputPipe? = attachStdout ? makeOutputPipe() : nil
+        let stderrPipe: OutputPipe? = (attachStderr && !isTTY) ? makeOutputPipe() : nil
 
         let stdio = [
-            stdinPipe.fileHandleForReading,
-            stdoutPipe?.fileHandleForWriting,
-            stderrPipe?.fileHandleForWriting,
+            stdinPipe.forProcess,
+            stdoutPipe?.forProcess,
+            stderrPipe?.forProcess,
         ]
 
         let process: ClientProcess
@@ -296,12 +308,10 @@ extension ContainerAttachRoute {
                     // Process monitor - when process exits, close pipes and finish stream
                     group.addTask {
                         defer {
-                            // Close pipes to break the reader loops
-                            try? stdoutPipe?.fileHandleForWriting.close()
-                            try? stderrPipe?.fileHandleForWriting.close()
-                            try? stdinPipe.fileHandleForWriting.close()
+                            if let fd = stdoutPipe?.forCleanup { close(fd) }
+                            if let fd = stderrPipe?.forCleanup { close(fd) }
+                            close(stdinPipe.forUsFd)
 
-                            // Close stream
                             streamContinuation.finish()
                         }
 
@@ -311,20 +321,15 @@ extension ContainerAttachRoute {
                         }
                     }
 
-                    if let stdoutHandle = stdoutPipe?.fileHandleForReading {
+                    if let stdoutHandle = stdoutPipe?.forUs {
                         group.addTask {
-                            defer {
-                                try? stdoutHandle.close()
-                            }
-
+                            defer { try? stdoutHandle.close() }
                             while true {
                                 do {
                                     guard let data = try stdoutHandle.read(upToCount: 8192), !data.isEmpty else {
-                                        try await Task.sleep(nanoseconds: 20_000_000)  // 20ms
-                                        continue
+                                        break
                                     }
-
-                                    let capacity = min(data.count + (isTTY ? 0 : 8), 65536)  // Cap buffer size
+                                    let capacity = min(data.count + (isTTY ? 0 : 8), 65536)
                                     var buffer = sharedAllocator.buffer(capacity: capacity)
                                     buffer.writeDockerFrame(streamType: .stdout, data: data, ttyMode: isTTY)
                                     streamContinuation.yield(buffer)
@@ -335,20 +340,15 @@ extension ContainerAttachRoute {
                         }
                     }
 
-                    if let stderrHandle = stderrPipe?.fileHandleForReading {
+                    if let stderrHandle = stderrPipe?.forUs {
                         group.addTask {
-                            defer {
-                                try? stderrHandle.close()
-                            }
-
+                            defer { try? stderrHandle.close() }
                             while true {
                                 do {
                                     guard let data = try stderrHandle.read(upToCount: 8192), !data.isEmpty else {
-                                        try await Task.sleep(nanoseconds: 20_000_000)  // 20ms
-                                        continue
+                                        break
                                     }
-
-                                    let capacity = min(data.count + 8, 65536)  // Cap buffer size
+                                    let capacity = min(data.count + 8, 65536)
                                     var buffer = sharedAllocator.buffer(capacity: capacity)
                                     buffer.writeDockerFrame(streamType: .stderr, data: data, ttyMode: isTTY)
                                     streamContinuation.yield(buffer)
@@ -359,17 +359,26 @@ extension ContainerAttachRoute {
                         }
                     }
 
-                    let stdinWriter = stdinPipe.fileHandleForWriting
+                    let stdinFd = stdinPipe.forUsFd
                     group.addTask {
                         defer {
-                            try? stdinWriter.close()
+                            close(stdinFd)
                         }
 
                         do {
                             for try await var buf in req.body {
                                 if let data = buf.readData(length: buf.readableBytes) {
-                                    try stdinWriter.write(contentsOf: data)
-                                    try stdinWriter.synchronize()
+                                    data.withUnsafeBytes { ptr in
+                                        guard let base = ptr.baseAddress else { return }
+                                        var remaining = ptr.count
+                                        var offset = 0
+                                        while remaining > 0 {
+                                            let written = Darwin.write(stdinFd, base + offset, remaining)
+                                            if written <= 0 { return }
+                                            offset += written
+                                            remaining -= written
+                                        }
+                                    }
                                 }
                             }
                         } catch {
@@ -386,10 +395,10 @@ extension ContainerAttachRoute {
             ttyEnabled: isTTY
         ) { channel, tcpHandler in
 
-            tcpHandler.setStdinWriter(stdinPipe.fileHandleForWriting)
+            tcpHandler.setStdinFd(stdinPipe.forUsFd)
 
             await withTaskGroup(of: Void.self) { group in
-                if let stdoutHandle = stdoutPipe?.fileHandleForReading {
+                if let stdoutHandle = stdoutPipe?.forUs {
                     group.addTask {
                         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
                             let dispatchIO = DispatchIO(
@@ -458,7 +467,7 @@ extension ContainerAttachRoute {
                     }
                 }
 
-                if let stderrHandle = stderrPipe?.fileHandleForReading {
+                if let stderrHandle = stderrPipe?.forUs {
                     group.addTask {
                         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
                             let dispatchIO = DispatchIO(
@@ -544,15 +553,257 @@ extension ContainerAttachRoute {
                     // Give a small delay for any final output to be processed
                     try? await Task.sleep(nanoseconds: 200_000_000)  // 200ms
 
-                    // Close all pipes to signal EOF to readers
-                    try? stdoutPipe?.fileHandleForWriting.close()
-                    try? stderrPipe?.fileHandleForWriting.close()
-                    try? stdinPipe.fileHandleForWriting.close()
+                    // Close dup'd stdout/stderr write ends to signal EOF to DispatchIO readers
+                    if let fd = stdoutPipe?.forCleanup { close(fd) }
+                    if let fd = stderrPipe?.forCleanup { close(fd) }
+                    tcpHandler.setStdinFd(-1)
 
                     // Close the channel gracefully
-                    _ = channel.eventLoop.submit {
-                        channel.close(promise: nil)
+                    if channel.isActive {
+                        _ = channel.eventLoop.submit {
+                            channel.close(promise: nil)
+                        }
                     }
+                }
+
+                for await _ in group {}
+            }
+        }
+    }
+
+    /// Attach to a stopped container by setting up pipes and waiting for /start to bootstrap.
+    ///
+    /// Flow: creates pipes → stores write fds in AttachManager → returns streaming response.
+    /// The pipe reads block until /start bootstraps the container with our pipe write fds.
+    /// /start also provides the process via AttachManager so we can monitor its lifecycle.
+    private static func handleAttachWithoutStdin(
+        req: Request,
+        client: ClientContainerProtocol,
+        container: ContainerSnapshot,
+        stdout: Bool,
+        stderr: Bool,
+        shouldUpgrade: Bool,
+        isTTY: Bool
+    ) async throws -> Response {
+
+        let attachStdout = stdout || (!stdout && !stderr)
+        let attachStderr = stderr && !isTTY
+
+        // Safe pipes: raw pipe(2) + dup()
+        let stdoutPipe: OutputPipe? = attachStdout ? makeOutputPipe() : nil
+        let stderrPipe: OutputPipe? = attachStderr ? makeOutputPipe() : nil
+
+        // Extra dup of write ends for /start to pass to bootstrap
+        let stdoutWriteFdForStart: Int32 = stdoutPipe.map { dup($0.forCleanup) } ?? -1
+        let stderrWriteFdForStart: Int32 = stderrPipe.map { dup($0.forCleanup) } ?? -1
+
+        // Store for /start to consume
+        await AttachManager.shared.storePipes(
+            id: container.id,
+            attach: .init(stdoutWriteFd: stdoutWriteFdForStart, stderrWriteFd: stderrWriteFdForStart)
+        )
+
+        let containerId = container.id
+
+        guard shouldUpgrade else {
+            return ConnectionHijackingMiddleware.createDockerStreamingResponse(
+                request: req,
+                ttyEnabled: isTTY
+            ) { streamContinuation in
+
+                await withTaskGroup(of: Void.self) { group in
+                    // Process monitor — waits for /start to provide process, then waits for exit
+                    group.addTask {
+                        defer {
+                            if let fd = stdoutPipe?.forCleanup { close(fd) }
+                            if let fd = stderrPipe?.forCleanup { close(fd) }
+                            streamContinuation.finish()
+                            Task { await AttachManager.shared.cleanup(id: containerId) }
+                        }
+                        guard let process = await AttachManager.shared.awaitProcess(id: containerId) else { return }
+                        do {
+                            let _ = try await process.wait()
+                        } catch {}
+                    }
+
+                    if let stdoutHandle = stdoutPipe?.forUs {
+                        group.addTask {
+                            defer { try? stdoutHandle.close() }
+                            while true {
+                                do {
+                                    guard let data = try stdoutHandle.read(upToCount: 8192), !data.isEmpty else { break }
+                                    let capacity = min(data.count + (isTTY ? 0 : 8), 65536)
+                                    var buffer = sharedAllocator.buffer(capacity: capacity)
+                                    buffer.writeDockerFrame(streamType: .stdout, data: data, ttyMode: isTTY)
+                                    streamContinuation.yield(buffer)
+                                } catch { break }
+                            }
+                        }
+                    }
+
+                    if let stderrHandle = stderrPipe?.forUs {
+                        group.addTask {
+                            defer { try? stderrHandle.close() }
+                            while true {
+                                do {
+                                    guard let data = try stderrHandle.read(upToCount: 8192), !data.isEmpty else { break }
+                                    let capacity = min(data.count + 8, 65536)
+                                    var buffer = sharedAllocator.buffer(capacity: capacity)
+                                    buffer.writeDockerFrame(streamType: .stderr, data: data, ttyMode: isTTY)
+                                    streamContinuation.yield(buffer)
+                                } catch { break }
+                            }
+                        }
+                    }
+
+                    for await _ in group {}
+                }
+            }
+        }
+
+        return Response.dockerTCPUpgrade(
+            execId: container.id,
+            ttyEnabled: isTTY
+        ) { channel, _ in
+
+            await withTaskGroup(of: Void.self) { group in
+                if let stdoutHandle = stdoutPipe?.forUs {
+                    group.addTask {
+                        let dispatchIO = DispatchIO(
+                            type: .stream,
+                            fileDescriptor: stdoutHandle.fileDescriptor,
+                            queue: DispatchQueue.global(qos: .userInteractive)
+                        ) { error in
+                            try? stdoutHandle.close()
+                        }
+
+                        dispatchIO.setLimit(lowWater: 1)
+                        dispatchIO.setLimit(highWater: 8192)
+
+                        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                            var hasCompleted = false
+                            let completionLock = NSLock()
+
+                            func safeComplete() {
+                                completionLock.lock()
+                                defer { completionLock.unlock() }
+                                guard !hasCompleted else { return }
+                                hasCompleted = true
+                                dispatchIO.close()
+                                continuation.resume()
+                            }
+
+                            dispatchIO.read(
+                                offset: 0,
+                                length: Int.max,
+                                queue: DispatchQueue.global(qos: .userInteractive)
+                            ) { done, data, error in
+
+                                completionLock.lock()
+                                let shouldProcess = !hasCompleted && channel.isActive
+                                completionLock.unlock()
+
+                                if shouldProcess, let data = data, !data.isEmpty {
+                                    channel.eventLoop.execute {
+                                        let capacity = min(data.count + (isTTY ? 0 : 8), 65536)
+                                        var outputBuffer = channel.allocator.buffer(capacity: capacity)
+                                        if isTTY {
+                                            outputBuffer.writeBytes(data)
+                                        } else {
+                                            outputBuffer.writeDockerFrame(streamType: .stdout, data: Data(data), ttyMode: false)
+                                        }
+                                        _ = channel.writeAndFlush(outputBuffer)
+                                    }
+                                }
+
+                                if done || error != 0 || !channel.isActive {
+                                    safeComplete()
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if let stderrHandle = stderrPipe?.forUs {
+                    group.addTask {
+                        let dispatchIO = DispatchIO(
+                            type: .stream,
+                            fileDescriptor: stderrHandle.fileDescriptor,
+                            queue: DispatchQueue.global(qos: .userInteractive)
+                        ) { error in
+                            try? stderrHandle.close()
+                        }
+
+                        dispatchIO.setLimit(lowWater: 1)
+                        dispatchIO.setLimit(highWater: 8192)
+
+                        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                            var hasCompleted = false
+                            let completionLock = NSLock()
+
+                            func safeComplete() {
+                                completionLock.lock()
+                                defer { completionLock.unlock() }
+                                guard !hasCompleted else { return }
+                                hasCompleted = true
+                                dispatchIO.close()
+                                continuation.resume()
+                            }
+
+                            dispatchIO.read(
+                                offset: 0,
+                                length: Int.max,
+                                queue: DispatchQueue.global(qos: .userInteractive)
+                            ) { done, data, error in
+
+                                completionLock.lock()
+                                let shouldProcess = !hasCompleted && channel.isActive
+                                completionLock.unlock()
+
+                                if shouldProcess, let data = data, !data.isEmpty {
+                                    channel.eventLoop.execute {
+                                        let capacity = min(data.count + 8, 65536)
+                                        var outputBuffer = channel.allocator.buffer(capacity: capacity)
+                                        outputBuffer.writeDockerFrame(streamType: .stderr, data: Data(data), ttyMode: false)
+                                        _ = channel.writeAndFlush(outputBuffer)
+                                    }
+                                }
+
+                                if done || error != 0 || !channel.isActive {
+                                    safeComplete()
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Process monitor — waits for /start to provide process, then waits for exit
+                group.addTask {
+                    guard let process = await AttachManager.shared.awaitProcess(id: containerId) else {
+                        if let fd = stdoutPipe?.forCleanup { close(fd) }
+                        if let fd = stderrPipe?.forCleanup { close(fd) }
+                        if channel.isActive {
+                            _ = channel.eventLoop.submit { channel.close(promise: nil) }
+                        }
+                        return
+                    }
+
+                    do {
+                        let _ = try await process.wait()
+                    } catch {}
+
+                    try? await Task.sleep(nanoseconds: 200_000_000)  // drain remaining output
+
+                    if let fd = stdoutPipe?.forCleanup { close(fd) }
+                    if let fd = stderrPipe?.forCleanup { close(fd) }
+
+                    if channel.isActive {
+                        _ = channel.eventLoop.submit {
+                            channel.close(promise: nil)
+                        }
+                    }
+
+                    Task { await AttachManager.shared.cleanup(id: containerId) }
                 }
 
                 for await _ in group {}

@@ -225,10 +225,10 @@ struct ExecRoute: RouteCollection {
                 return Response(status: .ok)
             }
 
-            // Check if client requested connection upgrade and attachStdin is true
+            // Docker CLI always sends Connection: Upgrade for exec/start, even without stdin
             let connectionHeader = req.headers.first(name: "Connection")?.lowercased()
             let upgradeHeader = req.headers.first(name: "Upgrade")?.lowercased()
-            let shouldUpgrade = connectionHeader?.contains("upgrade") == true && upgradeHeader == "tcp" && config.attachStdin
+            let shouldUpgrade = connectionHeader?.contains("upgrade") == true && upgradeHeader == "tcp"
 
             req.logger.info("exec/start Connection=\(connectionHeader ?? "nil") Upgrade=\(upgradeHeader ?? "nil") shouldUpgrade=\(shouldUpgrade)")
 
@@ -240,15 +240,15 @@ struct ExecRoute: RouteCollection {
                     ttyEnabled: tty
                 ) { streamContinuation in
 
-                    // Setup pipes
-                    let stdinPipe: Pipe? = config.attachStdin ? Pipe() : nil
-                    let stdoutPipe: Pipe? = config.attachStdout ? Pipe() : nil
-                    let stderrPipe: Pipe? = (config.attachStderr && !tty) ? Pipe() : nil
+                    // Safe pipes: raw pipe(2) + dup()
+                    let stdinPipe: StdinPipe? = config.attachStdin ? makeStdinPipe() : nil
+                    let stdoutPipe: OutputPipe? = config.attachStdout ? makeOutputPipe() : nil
+                    let stderrPipe: OutputPipe? = (config.attachStderr && !tty) ? makeOutputPipe() : nil
 
                     let stdio = Stdio(
-                        stdin: stdinPipe?.fileHandleForReading,
-                        stdout: stdoutPipe?.fileHandleForWriting,
-                        stderr: stderrPipe?.fileHandleForWriting
+                        stdin: stdinPipe?.forProcess,
+                        stdout: stdoutPipe?.forProcess,
+                        stderr: stderrPipe?.forProcess
                     )
 
                     let executable = config.cmd.first!
@@ -271,19 +271,16 @@ struct ExecRoute: RouteCollection {
 
                     await withTaskGroup(of: Void.self) { group in
                         // stdout handler
-                        if let stdoutHandle = stdoutPipe?.fileHandleForReading {
+                        if let stdoutHandle = stdoutPipe?.forUs {
                             group.addTask {
                                 defer {
                                     try? stdoutHandle.close()
                                 }
 
-                                let state = DockerConnectionState()
-
-                                while !state.shouldStop() {
+                                while true {
                                     do {
                                         guard let data = try stdoutHandle.read(upToCount: 8192), !data.isEmpty else {
-                                            try await Task.sleep(nanoseconds: 50_000_000)  // 50ms
-                                            continue
+                                            break  // EOF
                                         }
 
                                         let bufferSize = min(data.count + (tty ? 0 : 8), 65536)
@@ -298,19 +295,16 @@ struct ExecRoute: RouteCollection {
                         }
 
                         // stderr handler
-                        if let stderrHandle = stderrPipe?.fileHandleForReading {
+                        if let stderrHandle = stderrPipe?.forUs {
                             group.addTask {
                                 defer {
                                     try? stderrHandle.close()
                                 }
 
-                                let state = DockerConnectionState()
-
-                                while !state.shouldStop() {
+                                while true {
                                     do {
                                         guard let data = try stderrHandle.read(upToCount: 8192), !data.isEmpty else {
-                                            try await Task.sleep(nanoseconds: 50_000_000)  // 50ms
-                                            continue
+                                            break  // EOF
                                         }
 
                                         let bufferSize = min(data.count + 8, 65536)
@@ -325,16 +319,26 @@ struct ExecRoute: RouteCollection {
                         }
 
                         // stdin handler for HTTP mode
-                        if let stdinWriter = stdinPipe?.fileHandleForWriting {
+                        if let stdinFd = stdinPipe?.forUsFd {
                             group.addTask {
                                 defer {
-                                    try? stdinWriter.close()
+                                    close(stdinFd)
                                 }
 
                                 do {
                                     for try await var buf in req.body {
                                         if let data = buf.readData(length: buf.readableBytes) {
-                                            try stdinWriter.write(contentsOf: data)
+                                            data.withUnsafeBytes { ptr in
+                                                guard let base = ptr.baseAddress else { return }
+                                                var remaining = ptr.count
+                                                var offset = 0
+                                                while remaining > 0 {
+                                                    let written = Darwin.write(stdinFd, base + offset, remaining)
+                                                    if written <= 0 { return }
+                                                    offset += written
+                                                    remaining -= written
+                                                }
+                                            }
                                         }
                                     }
                                 } catch {
@@ -343,14 +347,10 @@ struct ExecRoute: RouteCollection {
                         }
 
                         // Process monitor
-                        // Process monitor
                         group.addTask {
                             defer {
-                                req.logger.info("exec/start [HTTP] process monitor: closing pipes")
-                                // Close all write ends to signal EOF
-                                try? stdoutPipe?.fileHandleForWriting.close()
-                                try? stderrPipe?.fileHandleForWriting.close()
-                                try? stdinPipe?.fileHandleForWriting.close()
+                                if let fd = stdoutPipe?.forCleanup { close(fd) }
+                                if let fd = stderrPipe?.forCleanup { close(fd) }
                             }
 
                             do {
@@ -378,20 +378,19 @@ struct ExecRoute: RouteCollection {
                 ttyEnabled: tty
             ) { channel, tcpHandler in
 
-                // Setup pipes with detailed logging
-                let stdinPipe: Pipe? = config.attachStdin ? Pipe() : nil
-                let stdoutPipe: Pipe? = config.attachStdout ? Pipe() : nil
-                let stderrPipe: Pipe? = (config.attachStderr && !tty) ? Pipe() : nil
+                // Safe pipes: raw pipe(2) + dup() — no Foundation Pipe auto-close issues
+                let stdinPipe: StdinPipe? = config.attachStdin ? makeStdinPipe() : nil
+                let stdoutPipe: OutputPipe? = config.attachStdout ? makeOutputPipe() : nil
+                let stderrPipe: OutputPipe? = (config.attachStderr && !tty) ? makeOutputPipe() : nil
 
                 let stdio = Stdio(
-                    stdin: stdinPipe?.fileHandleForReading,
-                    stdout: stdoutPipe?.fileHandleForWriting,
-                    stderr: stderrPipe?.fileHandleForWriting
+                    stdin: stdinPipe?.forProcess,
+                    stdout: stdoutPipe?.forProcess,
+                    stderr: stderrPipe?.forProcess
                 )
 
-                // Connect TCP handler to stdin writer for bidirectional communication
-                if let stdinWriter = stdinPipe?.fileHandleForWriting {
-                    tcpHandler.setStdinWriter(stdinWriter)
+                if let fd = stdinPipe?.forUsFd {
+                    tcpHandler.setStdinFd(fd)
                 }
 
                 let executable = config.cmd.first!
@@ -402,6 +401,7 @@ struct ExecRoute: RouteCollection {
                 processConfig.arguments = arguments
                 processConfig.terminal = tty
 
+                req.logger.info("exec/start [TCP] creating process for \(config.cmd)")
                 let process = try await ContainerClient().createProcess(
                     containerId: container.id,
                     processId: UUID().uuidString.lowercased(),
@@ -415,15 +415,14 @@ struct ExecRoute: RouteCollection {
 
                 // Setup bidirectional communication for interactive sessions
                 await withTaskGroup(of: Void.self) { group in
-                    // stdout/stderr -> channel (container output to client)
-                    if let stdoutHandle = stdoutPipe?.fileHandleForReading {
+                    // stdout -> channel (container output to client)
+                    if let stdoutHandle = stdoutPipe?.forUs {
                         group.addTask {
                             let dispatchIO = DispatchIO(
                                 type: .stream,
                                 fileDescriptor: stdoutHandle.fileDescriptor,
                                 queue: DispatchQueue.global(qos: .userInteractive)
                             ) { error in
-                                // Cleanup handler — safe to close FD here, after DispatchIO is fully done
                                 try? stdoutHandle.close()
                             }
 
@@ -477,18 +476,16 @@ struct ExecRoute: RouteCollection {
                         }
                     }
 
-                    if let stderrHandle = stderrPipe?.fileHandleForReading {
+                    if let stderrHandle = stderrPipe?.forUs {
                         group.addTask {
                             let dispatchIO = DispatchIO(
                                 type: .stream,
                                 fileDescriptor: stderrHandle.fileDescriptor,
                                 queue: DispatchQueue.global(qos: .userInteractive)
                             ) { error in
-                                // Cleanup handler — safe to close FD here, after DispatchIO is fully done
                                 try? stderrHandle.close()
                             }
 
-                            // Set up for streaming
                             dispatchIO.setLimit(lowWater: 1)
                             dispatchIO.setLimit(highWater: 1024)
 
@@ -505,10 +502,9 @@ struct ExecRoute: RouteCollection {
                                     continuation.resume()
                                 }
 
-                                // Start a continuous read operation
                                 dispatchIO.read(
                                     offset: 0,
-                                    length: Int.max,  // Read all available data
+                                    length: Int.max,
                                     queue: DispatchQueue.global(qos: .userInteractive)
                                 ) { done, data, error in
 
@@ -533,7 +529,7 @@ struct ExecRoute: RouteCollection {
                         }
                     }
 
-                    // Process monitor with proper cleanup
+                    // Process monitor
                     group.addTask {
                         do {
                             let exitCode = try await process.wait()
@@ -544,18 +540,17 @@ struct ExecRoute: RouteCollection {
                             await ExecManager.shared.markCompleted(id: execId, exitCode: -1)
                         }
 
-                        // Give a small delay for any final output to be processed
                         try? await Task.sleep(nanoseconds: 100_000_000)  // 100ms
 
                         req.logger.info("exec/start [TCP] closing pipes and channel")
-                        // Close all pipes to signal EOF to readers
-                        try? stdoutPipe?.fileHandleForWriting.close()
-                        try? stderrPipe?.fileHandleForWriting.close()
-                        try? stdinPipe?.fileHandleForWriting.close()
+                        if let fd = stdoutPipe?.forCleanup { close(fd) }
+                        if let fd = stderrPipe?.forCleanup { close(fd) }
+                        tcpHandler.setStdinFd(-1)
 
-                        // Close the channel gracefully
-                        _ = channel.eventLoop.submit {
-                            channel.close(promise: nil)
+                        if channel.isActive {
+                            _ = channel.eventLoop.submit {
+                                channel.close(promise: nil)
+                            }
                         }
                     }
 

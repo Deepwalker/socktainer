@@ -368,6 +368,14 @@ extension ContainerCreateRoute {
 
             containerConfiguration.mounts = resolvedMounts
 
+            // Apply resource limits from HostConfig
+            if let memory = body.HostConfig?.Memory, memory > 0 {
+                containerConfiguration.resources.memoryInBytes = UInt64(memory)
+            } else {
+                // Default to 4 GiB for dev containers (1 GiB is too little for VS Code Server + extensions)
+                containerConfiguration.resources.memoryInBytes = 4 * 1024 * 1024 * 1024
+            }
+
             req.logger.info("create: resolved \(resolvedMounts.count) mounts, creating container")
             let options = ContainerCreateOptions(autoRemove: body.HostConfig?.AutoRemove ?? false)
             let container: ContainerSnapshot

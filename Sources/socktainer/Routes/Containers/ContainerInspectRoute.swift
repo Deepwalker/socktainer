@@ -40,7 +40,7 @@ extension ContainerInspectRoute {
             let containerConfig: ContainerConfig = ContainerConfig(
                 Hostname: container.id,  // Use container ID as hostname since hostName property doesn't exist
                 Domainname: container.configuration.dns?.domain,
-                User: getUserString(from: container.configuration.initProcess.user),
+                User: getUserString(from: container.configuration.initProcess.user) ?? "",
                 AttachStdin: false,  // no mechanism to derive this value
                 AttachStdout: true,  // no mechanism to derive this value
                 AttachStderr: true,  // no mechanism to derive this value

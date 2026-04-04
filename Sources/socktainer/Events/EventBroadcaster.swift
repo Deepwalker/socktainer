@@ -4,10 +4,31 @@ struct EventBroadcasterKey: StorageKey {
     typealias Value = EventBroadcaster
 }
 
+/// Dynamic attributes map — includes standard fields + container labels.
+/// Encodes as a flat JSON object: {"containerExitCode":"","image":"","name":"...", "label.key":"value", ...}
 struct ActorAttributes: Codable {
-    let containerExitCode: String
-    let image: String
-    let name: String
+    private var storage: [String: String]
+
+    init(name: String, image: String = "", containerExitCode: String = "", labels: [String: String] = [:]) {
+        var s = [String: String]()
+        s["containerExitCode"] = containerExitCode
+        s["image"] = image
+        s["name"] = name
+        for (k, v) in labels {
+            s[k] = v
+        }
+        self.storage = s
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        self.storage = try container.decode([String: String].self)
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(storage)
+    }
 }
 
 struct DockerActor: Codable {
@@ -28,15 +49,15 @@ struct DockerEvent: Codable {
 }
 
 extension DockerEvent {
-    static func simpleEvent(id: String, type: String, status: String) -> DockerEvent {
+    static func simpleEvent(id: String, type: String, status: String, image: String = "", labels: [String: String] = [:]) -> DockerEvent {
         let now = Date()
         let timeSeconds = Int(now.timeIntervalSince1970)
         let timeNano = UInt64(now.timeIntervalSince1970 * 1_000_000_000)
 
         let actorAttributes = ActorAttributes(
-            containerExitCode: "",  // empty if unknown
-            image: "",
-            name: id
+            name: id,
+            image: image,
+            labels: labels
         )
         let actor = DockerActor(
             ID: id,
@@ -46,7 +67,7 @@ extension DockerEvent {
         return DockerEvent(
             status: status,
             id: id,
-            from: "",
+            from: image,
             Type: type,
             Action: status,
             Actor: actor,
