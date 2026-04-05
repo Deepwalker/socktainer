@@ -130,7 +130,7 @@ private struct DockerTCPProtocolUpgrader: HTTPServerProtocolUpgrader {
         // Allow remote half-closure so that when Docker CLI closes write-half
         // (no stdin to send), we keep the channel open for stdout writes.
         return channel.setOption(ChannelOptions.allowRemoteHalfClosure, value: true).flatMap {
-        context.pipeline.addHandler(tcpHandler).flatMap { _ in
+        channel.pipeline.addHandler(tcpHandler).flatMap { _ in
             _ = Task.detached { [streamHandler] in
                 do {
                     try await streamHandler(channel, tcpHandler)
@@ -396,7 +396,7 @@ extension ConnectionHijackingMiddleware {
 
 /// Utility for creating multiplexed stream frames
 public struct DockerStreamFrame {
-    public enum StreamType: UInt8 {
+    public enum StreamType: UInt8, Sendable {
         case stdin = 0  // Written on stdout
         case stdout = 1
         case stderr = 2
