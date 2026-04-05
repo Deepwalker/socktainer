@@ -64,7 +64,7 @@ actor HealthCheckManager {
         var failingStreak = 0
 
         while !Task.isCancelled {
-            guard await isActive(id: containerId) else { return }
+            guard isActive(id: containerId) else { return }
 
             let exitCode = await runCheck(containerId: containerId, config: config, timeoutNs: timeoutNs)
 
@@ -72,12 +72,12 @@ actor HealthCheckManager {
 
             if exitCode == 0 {
                 failingStreak = 0
-                await updateStatus(id: containerId, health: ContainerHealth(Status: "healthy", FailingStreak: 0, Log: []))
+                updateStatus(id: containerId, health: ContainerHealth(Status: "healthy", FailingStreak: 0, Log: []))
                 log.debug("[healthcheck] \(containerId) → healthy")
             } else {
                 failingStreak += 1
                 let status = failingStreak >= maxRetries ? "unhealthy" : "starting"
-                await updateStatus(id: containerId, health: ContainerHealth(Status: status, FailingStreak: failingStreak, Log: []))
+                updateStatus(id: containerId, health: ContainerHealth(Status: status, FailingStreak: failingStreak, Log: []))
                 log.info("[healthcheck] \(containerId) → \(status) (streak=\(failingStreak), exit=\(exitCode))")
             }
 
