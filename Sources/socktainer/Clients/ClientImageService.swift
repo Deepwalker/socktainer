@@ -115,45 +115,66 @@ struct ClientImageService: ClientImageProtocol {
         return AsyncThrowingStream { continuation in
             logger.info("Starting to pull image \(reference) for platform \(platform.description)")
             continuation.yield("Trying to pull \(reference)")
+
+            let progressHandler: @Sendable ([ProgressUpdateEvent]) async -> Void = { progressEvents in
+                for event in progressEvents {
+                    switch event {
+                    case .setDescription(let description),
+                        .setSubDescription(let description),
+                        .setItemsName(let description),
+                        .custom(let description):
+                        continuation.yield(description)
+                    case .addTotalSize(let size),
+                        .setTotalSize(let size),
+                        .addSize(let size),
+                        .setSize(let size):
+                        let humanReadableSize = ByteCountFormatter.string(fromByteCount: size, countStyle: .file)
+                        continuation.yield("Downloaded \(humanReadableSize)")
+                    case .addTotalItems(let items),
+                        .setTotalItems(let items),
+                        .addItems(let items),
+                        .setItems(let items):
+                        continuation.yield("Processing \(items) layer\(items == 1 ? "" : "s")")
+                    default:
+                        break
+                    }
+                }
+            }
+
             Task {
                 do {
-                    let image = try await ClientImage.pull(
-                        reference: reference,
-                        platform: platform,
-                        progressUpdate: { progressEvents in
-                            for event in progressEvents {
-                                switch event {
-                                case .setDescription(let description),
-                                    .setSubDescription(let description),
-                                    .setItemsName(let description),
-                                    .custom(let description):
-                                    continuation.yield(description)
-                                case .addTotalSize(let size),
-                                    .setTotalSize(let size),
-                                    .addSize(let size),
-                                    .setSize(let size):
-                                    let humanReadableSize = ByteCountFormatter.string(fromByteCount: size, countStyle: .file)
-                                    continuation.yield("Downloaded \(humanReadableSize)")
-                                case .addTotalItems(let items),
-                                    .setTotalItems(let items),
-                                    .addItems(let items),
-                                    .setItems(let items):
-                                    continuation.yield("Processing \(items) layer\(items == 1 ? "" : "s")")
-                                default:
-                                    break
-                                }
-                            }
-                        }
-                    )
+                    let image = try await ClientImage.pull(reference: reference, platform: platform, progressUpdate: progressHandler)
                     continuation.yield("Unpacking image")
                     try await image.unpack(platform: platform, progressUpdate: nil)
                     logger.info("Successfully pulled image \(reference) for platform \(platform.description)")
                     continuation.yield("Image digest: \(image.digest)")
                     continuation.finish()
                 } catch {
-                    logger.error("Failed to pull image \(reference): \(error)")
-                    continuation.yield(String(describing: error))
-                    continuation.finish(throwing: error)
+                    // On arm64 hosts: if the image doesn't support arm64, fall back to amd64 (Rosetta)
+                    let errorDesc = String(describing: error)
+                    if platform.architecture == "arm64",
+                        errorDesc.contains("does not support required platforms")
+                    {
+                        let amd64 = Platform(arch: "amd64", os: platform.os)
+                        logger.info("arm64 not available for \(reference), retrying with amd64 (Rosetta)")
+                        continuation.yield("linux/arm64 not available, retrying with linux/amd64 (Rosetta)")
+                        do {
+                            let image = try await ClientImage.pull(reference: reference, platform: amd64, progressUpdate: progressHandler)
+                            continuation.yield("Unpacking image")
+                            try await image.unpack(platform: amd64, progressUpdate: nil)
+                            logger.info("Successfully pulled image \(reference) for platform amd64")
+                            continuation.yield("Image digest: \(image.digest)")
+                            continuation.finish()
+                        } catch let fallbackError {
+                            logger.error("Failed to pull \(reference) for amd64: \(fallbackError)")
+                            continuation.yield(String(describing: fallbackError))
+                            continuation.finish(throwing: fallbackError)
+                        }
+                    } else {
+                        logger.error("Failed to pull image \(reference): \(error)")
+                        continuation.yield(String(describing: error))
+                        continuation.finish(throwing: error)
+                    }
                 }
             }
         }

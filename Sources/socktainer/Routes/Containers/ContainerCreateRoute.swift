@@ -101,15 +101,25 @@ extension ContainerCreateRoute {
             }
 
             req.logger.info("create: fetching image \(imageRef)")
-            let img = try await ClientImage.fetch(
-                reference: imageRef,
-                platform: requestedPlatform,
-            )
+            // On arm64 hosts, fall back to amd64 (Rosetta) if arm64 image is unavailable.
+            var effectivePlatform = requestedPlatform
+            let img: ClientImage
+            do {
+                img = try await ClientImage.fetch(reference: imageRef, platform: requestedPlatform)
+            } catch {
+                if requestedPlatform.architecture == "arm64", Platform.current.architecture == "arm64" {
+                    req.logger.info("create: arm64 not available for \(imageRef), trying amd64 (Rosetta)")
+                    effectivePlatform = Platform(arch: "amd64", os: "linux")
+                    img = try await ClientImage.fetch(reference: imageRef, platform: effectivePlatform)
+                } else {
+                    throw error
+                }
+            }
 
             // Unpack a fetched image before use
             req.logger.info("create: getCreateSnapshot for image")
             try await img.getCreateSnapshot(
-                platform: requestedPlatform
+                platform: effectivePlatform
             )
 
             req.logger.info("create: getting default kernel")
@@ -124,7 +134,7 @@ extension ContainerCreateRoute {
             _ = try await initImage.getCreateSnapshot(
                 platform: .current)
 
-            let imageConfig = try await img.config(for: requestedPlatform).config
+            let imageConfig = try await img.config(for: effectivePlatform).config
 
             let defaultUser: ProcessConfiguration.User = {
                 if let u = imageConfig?.user {
@@ -214,10 +224,10 @@ extension ContainerCreateRoute {
             )
 
             var containerConfiguration = ContainerConfiguration(id: id, image: img.description, process: processConfig)
-            containerConfiguration.platform = requestedPlatform
+            containerConfiguration.platform = effectivePlatform
 
             // Enable Rosetta when running amd64 images if on arm64 host
-            if Platform.current.architecture == "arm64" && requestedPlatform.architecture == "amd64" {
+            if Platform.current.architecture == "arm64" && effectivePlatform.architecture == "amd64" {
                 containerConfiguration.rosetta = true
             }
 
