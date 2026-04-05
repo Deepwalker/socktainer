@@ -1,3 +1,4 @@
+import ContainerAPIClient
 import Vapor
 
 struct ContainerDeleteRoute: RouteCollection {
@@ -13,6 +14,15 @@ extension ContainerDeleteRoute {
         { req in
             guard let id = req.parameters.get("id") else {
                 throw Abort(.badRequest, reason: "Missing container ID")
+            }
+
+            // Unregister DNS entries before deletion
+            if let dnsServer = req.application.storage[SocktainerDNSServerKey.self],
+                let container = try? await ContainerClient().get(id: id)
+            {
+                for attachment in container.networks {
+                    dnsServer.unregister(hostname: attachment.hostname)
+                }
             }
 
             // if running, stop it first

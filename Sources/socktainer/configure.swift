@@ -1,3 +1,4 @@
+import ContainerAPIClient
 import Vapor
 
 struct AppleContainerAppSupportUrlKey: StorageKey {
@@ -18,6 +19,25 @@ func configure(_ app: Application) async throws {
     let registryClient = ClientRegistryService()
     let archiveClient = ClientArchiveService(appSupportPath: appleContainerAppSupportUrl)
     let builderClient = ClientBuilderService(appSupportURL: appleContainerAppSupportUrl)
+
+    // DNS: start per-host UDP DNS server and per-network CoreDNS container manager
+    let dnsServer = SocktainerDNSServer()
+    let dnsPort = app.storage[SocktainerDNSPortKey.self] ?? 2054
+    dnsServer.start(port: dnsPort)
+    app.storage[SocktainerDNSServerKey.self] = dnsServer
+
+    let dnsManager = NetworkDNSManager(appSupportURL: appleContainerAppSupportUrl, dnsPort: dnsPort)
+    app.storage[NetworkDNSManagerKey.self] = dnsManager
+
+    // Rebuild DNS table from containers that are already running
+    let runningContainers = (try? await ContainerClient().list()) ?? []
+    for container in runningContainers {
+        guard container.status == .running else { continue }
+        guard container.configuration.labels["socktainer.role"] != "dns" else { continue }
+        for attachment in container.networks {
+            dnsServer.register(hostname: attachment.hostname, ip: attachment.ipv4Address.address.description)
+        }
+    }
 
     // Create and install regex routing middleware with logging
     let regexRouter = app.regexRouter(with: app.logger)

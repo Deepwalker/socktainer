@@ -259,20 +259,42 @@ extension ContainerCreateRoute {
             containerConfiguration.publishedPorts = publishedPorts
 
             // Handle DNS configuration from request
-            let nameservers = body.HostConfig?.Dns ?? []
             let searchDomains = body.HostConfig?.DnsSearch ?? []
             let dnsOptions = body.HostConfig?.DnsOptions ?? []
             let domain = (body.Domainname?.isEmpty == false) ? body.Domainname : nil
 
+            // Determine whether this container participates in DNS management.
+            // Skip if: network is "none", or the container is itself a DNS container.
+            let requestedLabels = body.Labels ?? [:]
+            let isNetworkNone = containerConfiguration.networks.allSatisfy { $0.network == "none" }
+            let isDnsContainer = requestedLabels["socktainer.role"] == "dns"
+            var resolvedNameservers: [String] = body.HostConfig?.Dns ?? []
+
+            if !isNetworkNone && !isDnsContainer,
+                let dnsManager = req.application.storage[NetworkDNSManagerKey.self]
+            {
+                // Ensure a CoreDNS container exists for the first network and use its IP
+                if let firstNetwork = containerConfiguration.networks.first {
+                    do {
+                        let dnsContainerIP = try await dnsManager.ensureDNSContainer(
+                            networkId: firstNetwork.network)
+                        resolvedNameservers = [dnsContainerIP]
+                    } catch {
+                        req.logger.warning(
+                            "DNS container setup failed for network \(firstNetwork.network), falling back to default DNS: \(error)"
+                        )
+                    }
+                }
+            }
+
             // Always set DNS configuration to ensure /etc/resolv.conf is created
-            // Even if empty, this ensures the file exists in the container
             containerConfiguration.dns = ContainerConfiguration.DNSConfiguration(
-                nameservers: nameservers,
+                nameservers: resolvedNameservers,
                 domain: domain,
                 searchDomains: searchDomains,
                 options: dnsOptions
             )
-            containerConfiguration.labels = body.Labels ?? [:]
+            containerConfiguration.labels = requestedLabels
 
             var resolvedMounts: [Filesystem] = []
 
@@ -389,6 +411,26 @@ extension ContainerCreateRoute {
             } catch {
                 req.logger.error("Failed to create container: \(error)")
                 throw Abort(.internalServerError, reason: "Failed to create container: \(error)")
+            }
+
+            // Register container hostnames in the DNS table
+            if !isNetworkNone && !isDnsContainer,
+                let dnsServer = req.application.storage[SocktainerDNSServerKey.self]
+            {
+                let endpointAliases: [String: [String]]
+                if let endpoints = body.NetworkingConfig?.EndpointsConfig {
+                    endpointAliases = endpoints.compactMapValues { $0.Aliases }
+                } else {
+                    endpointAliases = [:]
+                }
+                for attachment in container.networks {
+                    let ip = attachment.ipv4Address.address.description
+                    dnsServer.register(hostname: attachment.hostname, ip: ip)
+                    // Also register all aliases for this network
+                    for alias in (endpointAliases[attachment.network] ?? []) {
+                        dnsServer.register(hostname: alias, ip: ip)
+                    }
+                }
             }
 
             return RESTContainerCreate(

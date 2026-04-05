@@ -7,6 +7,10 @@ struct DefaultContainerMemoryKey: StorageKey {
     typealias Value = UInt64
 }
 
+struct SocktainerDNSPortKey: StorageKey {
+    typealias Value = Int
+}
+
 func parseMemoryString(_ s: String) -> UInt64 {
     let lowered = s.lowercased().trimmingCharacters(in: .whitespaces)
     let multipliers: [(String, UInt64)] = [
@@ -34,6 +38,9 @@ struct CLIOptions: ParsableArguments {
 
     @ArgumentParser.Option(name: .long, help: "Default container memory limit (e.g. 4g, 2048m). Default: 4g")
     var memory: String = "4g"
+
+    @ArgumentParser.Option(name: .long, help: "UDP port for the container DNS server. Default: 2054")
+    var dnsPort: Int = 2054
 }
 
 // Parse CLI before starting the app
@@ -62,6 +69,7 @@ let defaultMemoryBytes = parseMemoryString(options.memory)
 // Create and configure the Vapor application
 let app = try await Application.make(env)
 app.storage[DefaultContainerMemoryKey.self] = defaultMemoryBytes
+app.storage[SocktainerDNSPortKey.self] = options.dnsPort
 try prepareUnixSocket(for: app, homeDirectory: ProcessInfo.processInfo.environment["HOME"])
 try await configure(app)
 
