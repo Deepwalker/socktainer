@@ -294,7 +294,28 @@ extension ContainerCreateRoute {
                 searchDomains: searchDomains,
                 options: dnsOptions
             )
-            containerConfiguration.labels = requestedLabels
+            // Compute endpoint aliases now (before create) so we can store DNS names in a label.
+            // This label is read on socktainer restart to re-populate the DNS table, including
+            // Docker Compose service names that arrive as Aliases (not as hostname).
+            let endpointAliases: [String: [String]]
+            if let endpoints = body.NetworkingConfig?.EndpointsConfig {
+                endpointAliases = endpoints.compactMapValues { $0.Aliases }
+            } else {
+                endpointAliases = [:]
+            }
+
+            var labels = requestedLabels
+            if !isNetworkNone && !isDnsContainer {
+                var dnsNames: [String] = containerConfiguration.networks.map { $0.options.hostname }
+                for aliases in endpointAliases.values { dnsNames.append(contentsOf: aliases) }
+                var seen = Set<String>()
+                let uniqueNames = dnsNames.filter { !$0.isEmpty && seen.insert($0).inserted }
+                if !uniqueNames.isEmpty {
+                    labels["socktainer.dns.names"] = uniqueNames.joined(separator: ",")
+                    req.logger.debug("DNS names for container: \(uniqueNames.joined(separator: ", "))")
+                }
+            }
+            containerConfiguration.labels = labels
 
             var resolvedMounts: [Filesystem] = []
 
@@ -417,16 +438,10 @@ extension ContainerCreateRoute {
             if !isNetworkNone && !isDnsContainer,
                 let dnsServer = req.application.storage[SocktainerDNSServerKey.self]
             {
-                let endpointAliases: [String: [String]]
-                if let endpoints = body.NetworkingConfig?.EndpointsConfig {
-                    endpointAliases = endpoints.compactMapValues { $0.Aliases }
-                } else {
-                    endpointAliases = [:]
-                }
                 for attachment in container.networks {
                     let ip = attachment.ipv4Address.address.description
                     dnsServer.register(hostname: attachment.hostname, ip: ip)
-                    // Also register all aliases for this network
+                    // Also register all aliases for this network (includes Compose service names)
                     for alias in (endpointAliases[attachment.network] ?? []) {
                         dnsServer.register(hostname: alias, ip: ip)
                     }

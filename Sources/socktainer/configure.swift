@@ -34,8 +34,19 @@ func configure(_ app: Application) async throws {
     for container in runningContainers {
         guard container.status == .running else { continue }
         guard container.configuration.labels["socktainer.role"] != "dns" else { continue }
-        for attachment in container.networks {
-            dnsServer.register(hostname: attachment.hostname, ip: attachment.ipv4Address.address.description)
+        if let namesLabel = container.configuration.labels["socktainer.dns.names"],
+            let firstAttachment = container.networks.first
+        {
+            // Use stored label that includes all aliases (e.g. Docker Compose service names)
+            let ip = firstAttachment.ipv4Address.address.description
+            for name in namesLabel.split(separator: ",").map(String.init) where !name.isEmpty {
+                dnsServer.register(hostname: name, ip: ip)
+            }
+        } else {
+            // Fallback for containers created before this feature
+            for attachment in container.networks {
+                dnsServer.register(hostname: attachment.hostname, ip: attachment.ipv4Address.address.description)
+            }
         }
     }
 
@@ -168,6 +179,9 @@ func configure(_ app: Application) async throws {
 
     // --- session route ---
     try app.register(collection: SessionRoute())
+
+    // --- debug ---
+    try app.register(collection: DebugDNSRoute())
 
     // --- miscellaneous ---
     try app.register(collection: AuthRoute(client: registryClient))

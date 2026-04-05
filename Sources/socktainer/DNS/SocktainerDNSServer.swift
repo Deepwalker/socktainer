@@ -25,6 +25,12 @@ final class SocktainerDNSServer: @unchecked Sendable {
         log.info("[dns] registered \(key) → \(ip)")
     }
 
+    func listEntries() -> [String: String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return entries.mapValues { ip in "\(ip[0]).\(ip[1]).\(ip[2]).\(ip[3])" }
+    }
+
     func unregister(hostname: String) {
         lock.lock()
         defer { lock.unlock() }
@@ -136,7 +142,12 @@ final class SocktainerDNSServer: @unchecked Sendable {
             }
         }
 
-        log.debug("[dns] \(qtypeStr) \(normalized) → forwarding to 1.1.1.1")
+        // Log short names (no dots) at info — those are the container/service lookups that miss the table
+        if !normalized.contains(".") {
+            log.info("[dns] \(qtypeStr) \(normalized) → not in table, forwarding to 1.1.1.1")
+        } else {
+            log.debug("[dns] \(qtypeStr) \(normalized) → forwarding to 1.1.1.1")
+        }
         return forwardToUpstream(packet)
     }
 
