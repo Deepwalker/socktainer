@@ -33,6 +33,8 @@ extension ContainerDeleteRoute {
                 }
             }
 
+            await req.application.storage[HealthCheckManagerKey.self]?.stop(containerId: id)
+
             // if running, stop it first
             if let container = try await client.getContainer(id: id),
                 container.status == .running

@@ -85,6 +85,14 @@ extension ContainerStartRoute {
                 }
             }
 
+            // Start healthcheck loop if container has a stored healthcheck config
+            if let hcManager = req.application.storage[HealthCheckManagerKey.self],
+                let hcJson = containerLabels["socktainer.healthcheck"],
+                let hcConfig = try? JSONDecoder().decode(HealthcheckConfig.self, from: Data(hcJson.utf8))
+            {
+                await hcManager.start(containerId: id, config: hcConfig)
+            }
+
             let broadcaster = req.application.storage[EventBroadcasterKey.self]!
             let event = DockerEvent.simpleEvent(id: id, type: "container", status: "start", image: containerImage, labels: containerLabels)
             await broadcaster.broadcast(event)

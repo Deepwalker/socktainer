@@ -23,6 +23,7 @@ extension ContainerStopRoute {
             let signal = query.signal
             let timeout = query.t
 
+            await req.application.storage[HealthCheckManagerKey.self]?.stop(containerId: id)
             try await client.stop(id: id, signal: signal, timeout: timeout)
 
             let broadcaster = req.application.storage[EventBroadcasterKey.self]!

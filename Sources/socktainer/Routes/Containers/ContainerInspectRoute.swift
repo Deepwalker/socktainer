@@ -160,10 +160,17 @@ extension ContainerInspectRoute {
 
             let createdAt = AppleContainerTimestampResolver.containerCreationDate(container)
 
-            // Apple Container doesn't run healthchecks; report running containers as healthy.
-            let health: ContainerHealth? = (container.status == .running && healthcheckConfig != nil)
-                ? ContainerHealth(Status: "healthy", FailingStreak: 0, Log: [])
-                : nil
+            // Use real health status from HealthCheckManager if available,
+            // otherwise fall back to "starting" for running containers with a healthcheck.
+            let health: ContainerHealth?
+            if healthcheckConfig != nil {
+                health = await req.application.storage[HealthCheckManagerKey.self]?.currentHealth(for: container.id)
+                    ?? (container.status == .running
+                        ? ContainerHealth(Status: "starting", FailingStreak: 0, Log: [])
+                        : nil)
+            } else {
+                health = nil
+            }
 
             let containerState: ContainerState = ContainerState(
                 Status: container.status.mobyState,

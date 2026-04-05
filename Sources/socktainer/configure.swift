@@ -29,6 +29,9 @@ func configure(_ app: Application) async throws {
     let dnsManager = NetworkDNSManager(appSupportURL: appleContainerAppSupportUrl, dnsPort: dnsPort)
     app.storage[NetworkDNSManagerKey.self] = dnsManager
 
+    let healthCheckManager = HealthCheckManager()
+    app.storage[HealthCheckManagerKey.self] = healthCheckManager
+
     // Rebuild DNS table from containers that are already running
     let runningContainers = (try? await ContainerClient().list()) ?? []
     for container in runningContainers {
