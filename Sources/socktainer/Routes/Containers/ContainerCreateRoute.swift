@@ -423,7 +423,8 @@ extension ContainerCreateRoute {
                         format: volume.format,
                         source: volume.source,
                         destination: parsed.destination,
-                        options: parsed.options
+                        options: parsed.options,
+                        sync: .nosync
                     )
                     resolvedMounts.append(volumeMount)
                 }
