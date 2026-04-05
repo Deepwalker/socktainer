@@ -71,6 +71,20 @@ extension ContainerStartRoute {
                 req.logger.debug("Container \(id) was already running or bootstrapped")
             }
 
+            // Register DNS names now that the container is running and has an IP.
+            // Names were stored in the label at create time (includes Compose service aliases).
+            if let dnsServer = req.application.storage[SocktainerDNSServerKey.self],
+                containerLabels["socktainer.role"] != "dns",
+                let namesLabel = containerLabels["socktainer.dns.names"],
+                let snapshot = try? await ContainerClient().get(id: id),
+                let firstAttachment = snapshot.networks.first
+            {
+                let ip = firstAttachment.ipv4Address.address.description
+                for name in namesLabel.split(separator: ",").map(String.init) where !name.isEmpty {
+                    dnsServer.register(hostname: name, ip: ip)
+                }
+            }
+
             let broadcaster = req.application.storage[EventBroadcasterKey.self]!
             let event = DockerEvent.simpleEvent(id: id, type: "container", status: "start", image: containerImage, labels: containerLabels)
             await broadcaster.broadcast(event)

@@ -434,20 +434,6 @@ extension ContainerCreateRoute {
                 throw Abort(.internalServerError, reason: "Failed to create container: \(error)")
             }
 
-            // Register container hostnames in the DNS table
-            if !isNetworkNone && !isDnsContainer,
-                let dnsServer = req.application.storage[SocktainerDNSServerKey.self]
-            {
-                for attachment in container.networks {
-                    let ip = attachment.ipv4Address.address.description
-                    dnsServer.register(hostname: attachment.hostname, ip: ip)
-                    // Also register all aliases for this network (includes Compose service names)
-                    for alias in (endpointAliases[attachment.network] ?? []) {
-                        dnsServer.register(hostname: alias, ip: ip)
-                    }
-                }
-            }
-
             return RESTContainerCreate(
                 Id: container.id,
                 Warnings: []
