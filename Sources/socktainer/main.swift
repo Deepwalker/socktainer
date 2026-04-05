@@ -70,7 +70,9 @@ let defaultMemoryBytes = parseMemoryString(options.memory)
 let app = try await Application.make(env)
 app.storage[DefaultContainerMemoryKey.self] = defaultMemoryBytes
 app.storage[SocktainerDNSPortKey.self] = options.dnsPort
-try prepareUnixSocket(for: app, homeDirectory: ProcessInfo.processInfo.environment["HOME"])
+let homeDirectory = ProcessInfo.processInfo.environment["HOME"] ?? ""
+try prepareUnixSocket(for: app, homeDirectory: homeDirectory)
+setupDockerContext(socketPath: "\(homeDirectory)/.socktainer/container.sock", homeDirectory: homeDirectory)
 try await configure(app)
 
 // Start the app
