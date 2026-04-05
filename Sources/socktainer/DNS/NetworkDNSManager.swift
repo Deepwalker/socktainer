@@ -67,10 +67,9 @@ actor NetworkDNSManager {
 
         // Build container configuration
         let platform = Platform.current
-        let imageRef = "coredns/coredns:latest"
+        let imageRef = try ClientImage.normalizeReference("coredns/coredns:latest")
         let image = try await ClientImage.fetch(reference: imageRef, platform: platform)
         _ = try await image.getCreateSnapshot(platform: platform)
-        let imageDesc = ImageDescription(reference: imageRef, descriptor: image.descriptor)
 
         let processConfig = ProcessConfiguration(
             executable: "/coredns",
@@ -81,7 +80,7 @@ actor NetworkDNSManager {
             user: .id(uid: 0, gid: 0)
         )
 
-        var config = ContainerConfiguration(id: containerId, image: imageDesc, process: processConfig)
+        var config = ContainerConfiguration(id: containerId, image: image.description, process: processConfig)
         config.labels = [
             "socktainer.role": "dns",
             "socktainer.network": networkId,
