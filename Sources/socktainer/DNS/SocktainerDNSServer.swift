@@ -175,7 +175,8 @@ final class SocktainerDNSServer: @unchecked Sendable {
 
     private func buildAResponse(packet: [UInt8], ip: [UInt8]) -> [UInt8] {
         var response = packet
-        let rd = (UInt16(packet[2]) << 8) | UInt16(packet[3]) & 0x0100
+        let flags = (UInt16(packet[2]) << 8) | UInt16(packet[3])
+        let rd = flags & 0x0100
         let rflags: UInt16 = 0x8400 | rd  // QR=1, AA=1, preserve RD
         response[2] = UInt8(rflags >> 8)
         response[3] = UInt8(rflags & 0xFF)
@@ -197,7 +198,8 @@ final class SocktainerDNSServer: @unchecked Sendable {
 
     private func buildNodataResponse(packet: [UInt8]) -> [UInt8] {
         var response = packet
-        let rd = (UInt16(packet[2]) << 8) | UInt16(packet[3]) & 0x0100
+        let flags = (UInt16(packet[2]) << 8) | UInt16(packet[3])
+        let rd = flags & 0x0100
         let rflags: UInt16 = 0x8400 | rd  // QR=1, AA=1
         response[2] = UInt8(rflags >> 8)
         response[3] = UInt8(rflags & 0xFF)

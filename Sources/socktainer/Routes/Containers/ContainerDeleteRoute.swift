@@ -16,12 +16,20 @@ extension ContainerDeleteRoute {
                 throw Abort(.badRequest, reason: "Missing container ID")
             }
 
-            // Unregister DNS entries before deletion
+            // Unregister DNS entries before deletion.
+            // Use socktainer.dns.names label (written at create time) to catch all aliases
+            // including Docker Compose service names, not just attachment.hostname.
             if let dnsServer = req.application.storage[SocktainerDNSServerKey.self],
                 let container = try? await ContainerClient().get(id: id)
             {
-                for attachment in container.networks {
-                    dnsServer.unregister(hostname: attachment.hostname)
+                if let namesLabel = container.configuration.labels["socktainer.dns.names"] {
+                    for name in namesLabel.split(separator: ",").map(String.init) where !name.isEmpty {
+                        dnsServer.unregister(hostname: name)
+                    }
+                } else {
+                    for attachment in container.networks {
+                        dnsServer.unregister(hostname: attachment.hostname)
+                    }
                 }
             }
 
