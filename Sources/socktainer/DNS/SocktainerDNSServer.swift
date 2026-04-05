@@ -69,6 +69,10 @@ final class SocktainerDNSServer: @unchecked Sendable {
 
         var buf = [UInt8](repeating: 0, count: 512)
 
+        // recvfrom loop must never block on handleQuery — each query is dispatched
+        // to a concurrent thread so the loop keeps draining the socket buffer.
+        // (forwardToUpstream blocks up to 2s waiting for 1.1.1.1; without async
+        //  dispatch every pending query times out while the loop is stuck.)
         while true {
             var clientAddr = sockaddr_in()
             var clientLen = socklen_t(MemoryLayout<sockaddr_in>.size)
@@ -79,13 +83,19 @@ final class SocktainerDNSServer: @unchecked Sendable {
             }
             guard n > 12 else { continue }
 
+            // Copy before next recvfrom iteration overwrites buf
             let packet = Array(buf[0..<n])
-            guard let response = handleQuery(packet) else { continue }
+            let capturedAddr = clientAddr
+            let capturedLen = clientLen
 
-            _ = response.withUnsafeBytes { responsePtr in
-                withUnsafePointer(to: &clientAddr) {
-                    $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                        sendto(fd, responsePtr.baseAddress!, response.count, 0, $0, clientLen)
+            DispatchQueue.global(qos: .userInitiated).async {
+                guard let response = self.handleQuery(packet) else { return }
+                var addr = capturedAddr
+                _ = response.withUnsafeBytes { ptr in
+                    withUnsafePointer(to: &addr) {
+                        $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                            sendto(fd, ptr.baseAddress!, response.count, 0, $0, capturedLen)
+                        }
                     }
                 }
             }
