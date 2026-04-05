@@ -19,6 +19,12 @@ actor NetworkDNSManager {
     private let dnsPort: Int
     private var containerIPs: [String: String] = [:]  // networkId → DNS container IP
 
+    /// In-flight creation tasks. Without this, multiple concurrent container creations
+    /// would race: each caller checks `containerIPs == nil`, all proceed past that
+    /// check before any finishes (actor releases lock at each `await`), and all try
+    /// to create the same DNS container simultaneously.
+    private var pendingCreation: [String: Task<String, Error>] = [:]
+
     init(appSupportURL: URL, dnsPort: Int = 2054) {
         self.appSupportURL = appSupportURL
         self.dnsPort = dnsPort
@@ -26,21 +32,57 @@ actor NetworkDNSManager {
 
     /// Returns the IP of the DNS container for `networkId`, creating it if needed.
     func ensureDNSContainer(networkId: String) async throws -> String {
-        if let ip = containerIPs[networkId] {
-            return ip
+        // Fast path: already resolved
+        if let ip = containerIPs[networkId] { return ip }
+
+        // Coalesce concurrent callers: if a creation is already in-flight, wait for it.
+        // Both checks + task assignment happen synchronously (no await between them),
+        // so subsequent callers always find the pending task before it completes.
+        if let pending = pendingCreation[networkId] {
+            return try await pending.value
         }
 
+        // Capture values before any suspension point
+        let appSupportURL = self.appSupportURL
+        let dnsPort = self.dnsPort
+
+        let task = Task<String, Error> {
+            try await Self.createDNSContainerWork(
+                networkId: networkId,
+                appSupportURL: appSupportURL,
+                dnsPort: dnsPort
+            )
+        }
+        pendingCreation[networkId] = task
+
+        do {
+            let ip = try await task.value
+            containerIPs[networkId] = ip
+            pendingCreation.removeValue(forKey: networkId)
+            return ip
+        } catch {
+            pendingCreation.removeValue(forKey: networkId)
+            throw error
+        }
+    }
+
+    /// All container creation logic is in a static (non-actor-isolated) function
+    /// so it runs outside the actor's executor, preventing deadlock with the
+    /// Task created above.
+    private static func createDNSContainerWork(
+        networkId: String,
+        appSupportURL: URL,
+        dnsPort: Int
+    ) async throws -> String {
         let containerClient = ContainerClient()
-        let containerId = dnsContainerId(for: networkId)
+        let containerId = "socktainer-dns-\(networkId)"
 
         // Reuse if already running
         if let snapshot = try? await containerClient.get(id: containerId),
             snapshot.status == .running,
             let attachment = snapshot.networks.first(where: { $0.network == networkId })
         {
-            let ip = attachment.ipv4Address.address.description
-            containerIPs[networkId] = ip
-            return ip
+            return attachment.ipv4Address.address.description
         }
 
         // Get the network's gateway IP for the Corefile
@@ -53,8 +95,7 @@ actor NetworkDNSManager {
 
         // Write Corefile to a host directory that will be virtiofs-mounted
         let corefileDir = appSupportURL.appendingPathComponent("dns/\(networkId)")
-        try FileManager.default.createDirectory(
-            at: corefileDir, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: corefileDir, withIntermediateDirectories: true)
         let corefileURL = corefileDir.appendingPathComponent("Corefile")
         let corefile = """
             . {
@@ -93,7 +134,7 @@ actor NetworkDNSManager {
                 network: networkId,
                 options: AttachmentOptions(hostname: "dns-\(networkId)"))
         ]
-        // Use the vmnet gateway DNS directly for CoreDNS itself (not itself to avoid loops)
+        // Use the vmnet gateway DNS directly so CoreDNS doesn't loop back to itself
         config.dns = ContainerConfiguration.DNSConfiguration(
             nameservers: [gatewayIP],
             domain: nil,
@@ -103,11 +144,16 @@ actor NetworkDNSManager {
 
         let kernel = try await ClientKernel.getDefaultKernel(for: .current)
 
-        // Delete stale container if it exists in stopped/unknown state
-        try? await containerClient.delete(id: containerId)
+        // Clean up any stale container (stop first if running, then delete)
+        if let existing = try? await containerClient.get(id: containerId) {
+            if existing.status == .running {
+                try? await containerClient.stop(id: containerId)
+            }
+            try? await containerClient.delete(id: containerId)
+        }
 
         try await containerClient.create(configuration: config, options: .default, kernel: kernel)
-        try await startContainer(id: containerId, containerClient: containerClient)
+        try await startDNSContainer(id: containerId, containerClient: containerClient)
 
         let snapshot = try await containerClient.get(id: containerId)
         guard let attachment = snapshot.networks.first(where: { $0.network == networkId }) else {
@@ -115,12 +161,10 @@ actor NetworkDNSManager {
                 .invalidState, message: "DNS container for network \(networkId) has no attachment")
         }
 
-        let ip = attachment.ipv4Address.address.description
-        containerIPs[networkId] = ip
-        return ip
+        return attachment.ipv4Address.address.description
     }
 
-    private func startContainer(id: String, containerClient: ContainerClient) async throws {
+    private static func startDNSContainer(id: String, containerClient: ContainerClient) async throws {
         let io = try ProcessIO.create(tty: false, interactive: false, detach: true)
         defer { try? io.close() }
         do {
@@ -133,9 +177,5 @@ actor NetworkDNSManager {
             throw ContainerizationError(
                 .internalError, message: "failed to start DNS container: \(error)")
         }
-    }
-
-    private func dnsContainerId(for networkId: String) -> String {
-        "socktainer-dns-\(networkId)"
     }
 }
