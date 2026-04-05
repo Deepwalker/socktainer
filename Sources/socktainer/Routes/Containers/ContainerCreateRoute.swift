@@ -315,6 +315,14 @@ extension ContainerCreateRoute {
             }
 
             var labels = requestedLabels
+            // Store healthcheck so inspect can report it and compose service_healthy works.
+            // Test == ["NONE"] means explicitly disabled; nil means inherit from image.
+            if let hc = body.Healthcheck, hc.Test?.first != "NONE",
+                let data = try? JSONEncoder().encode(hc),
+                let json = String(data: data, encoding: .utf8)
+            {
+                labels["socktainer.healthcheck"] = json
+            }
             if !isNetworkNone && !isDnsContainer {
                 var dnsNames: [String] = containerConfiguration.networks.map { $0.options.hostname }
                 for aliases in endpointAliases.values { dnsNames.append(contentsOf: aliases) }

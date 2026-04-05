@@ -1,5 +1,18 @@
 import Vapor
 
+struct ContainerHealthLog: Content {
+    let Start: String
+    let End: String
+    let ExitCode: Int
+    let Output: String
+}
+
+struct ContainerHealth: Content {
+    let Status: String  // "healthy" | "unhealthy" | "starting" | "none"
+    let FailingStreak: Int
+    let Log: [ContainerHealthLog]
+}
+
 struct ContainerState: Content {
     let Status: String
     let Running: Bool
@@ -12,6 +25,7 @@ struct ContainerState: Content {
     let Error: String
     let StartedAt: String
     let FinishedAt: String
+    let Health: ContainerHealth?
 }
 
 struct RESTContainerSummary: Content {

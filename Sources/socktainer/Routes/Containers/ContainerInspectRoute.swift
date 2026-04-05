@@ -37,6 +37,11 @@ extension ContainerInspectRoute {
                     }
             )
 
+            // Parse stored healthcheck so both Config.Healthcheck and State.Health are populated
+            let healthcheckConfig = container.configuration.labels["socktainer.healthcheck"].flatMap { json in
+                try? JSONDecoder().decode(HealthcheckConfig.self, from: Data(json.utf8))
+            }
+
             let containerConfig: ContainerConfig = ContainerConfig(
                 Hostname: container.id,  // Use container ID as hostname since hostName property doesn't exist
                 Domainname: container.configuration.dns?.domain,
@@ -50,7 +55,7 @@ extension ContainerInspectRoute {
                 StdinOnce: false,  // no mechanism to derive this value
                 Env: container.configuration.initProcess.environment.isEmpty ? nil : container.configuration.initProcess.environment,
                 Cmd: container.configuration.initProcess.arguments.isEmpty ? nil : container.configuration.initProcess.arguments,
-                Healthcheck: nil,  // Apple containers don't have a healthcheck
+                Healthcheck: healthcheckConfig,
                 ArgsEscaped: false,  // no mechanism to derive this value
                 Image: container.configuration.image.reference,
                 Volumes: nil,  // Could be derived from mounts if needed
@@ -155,18 +160,24 @@ extension ContainerInspectRoute {
 
             let createdAt = AppleContainerTimestampResolver.containerCreationDate(container)
 
+            // Apple Container doesn't run healthchecks; report running containers as healthy.
+            let health: ContainerHealth? = (container.status == .running && healthcheckConfig != nil)
+                ? ContainerHealth(Status: "healthy", FailingStreak: 0, Log: [])
+                : nil
+
             let containerState: ContainerState = ContainerState(
                 Status: container.status.mobyState,
                 Running: container.status == .running,
-                Paused: false,  // Apple containers don't have a paused state like Docker
+                Paused: false,
                 Restarting: false,
                 OOMKilled: false,
                 Dead: container.status == .stopped,
-                Pid: 0,  // we have no mechanism to derive PID in Apple container
+                Pid: 0,
                 ExitCode: container.status == .stopped ? 0 : 0,
                 Error: "",
                 StartedAt: container.startedDate.map { AppleContainerTimestampResolver.iso8601Timestamp($0) } ?? "",
-                FinishedAt: container.status == .stopped ? "1970-01-01T00:00:00.000000000Z" : ""
+                FinishedAt: container.status == .stopped ? "1970-01-01T00:00:00.000000000Z" : "",
+                Health: health
             )
 
             return RESTContainerInspect(
