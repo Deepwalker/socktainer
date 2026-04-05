@@ -138,10 +138,12 @@ struct ClientContainerService: ClientContainerProtocol {
             // Try exact match first
             return try await containerClient.get(id: id)
         } catch let error as ContainerizationError where error.code == .notFound {
-            // If not found by exact ID, try prefix match (short ID support)
+            // If not found by exact ID, try prefix match (short ID support).
+            // Reject ambiguous prefixes that match more than one container.
             let allContainers = try await containerClient.list()
-            if let container = allContainers.first(where: { $0.id.hasPrefix(id) }) {
-                return container
+            let matches = allContainers.filter { $0.id.hasPrefix(id) }
+            if matches.count == 1 {
+                return matches[0]
             }
             return nil
         }

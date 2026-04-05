@@ -196,8 +196,10 @@ extension BuildRoute {
 
                         req.logger.info("[build-perf] \(perfMs())ms tar extracted")
 
-                        if extractProc.terminationStatus > 1 {
-                            // exit >1 = fatal; exit 1 = warning (missing tar padding/EOF — safe to ignore)
+                        if extractProc.terminationStatus == 1 {
+                            // exit 1 = BSD tar warning (e.g. truncated trailing block) — extraction succeeded
+                            req.logger.warning("tar exited with code 1 (non-fatal): \(stderrText)")
+                        } else if extractProc.terminationStatus > 1 {
                             let debugCopy = "/tmp/socktainer-debug-\(buildUUID).tar"
                             try? FileManager.default.copyItem(atPath: tarPath.path, toPath: debugCopy)
                             req.logger.error("tar extraction failed, debug copy: \(debugCopy)")

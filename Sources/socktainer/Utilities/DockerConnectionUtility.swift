@@ -227,10 +227,9 @@ public final class DockerTCPHandler: ChannelInboundHandler, @unchecked Sendable 
         stdinFd = fd
         let buffered = pendingData
         pendingData = []
-        lock.unlock()
-
-        // Close old fd if it was valid
+        // Close old fd inside the lock to prevent TOCTOU with channelRead
         if oldFd >= 0 && oldFd != fd { close(oldFd) }
+        lock.unlock()
 
         // Flush any data that arrived before the fd was set
         if fd >= 0 {

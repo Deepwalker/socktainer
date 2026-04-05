@@ -1,4 +1,5 @@
 import ContainerAPIClient
+import Darwin
 import Foundation
 
 /// Coordinates the docker run flow between /attach and /start.
@@ -51,7 +52,15 @@ actor AttachManager {
 
     /// Clean up all state for a container.
     func cleanup(id: String) {
-        pendingAttaches.removeValue(forKey: id)
+        // Close unconsumed pipe fds to avoid fd leaks when /start is never called
+        if let attach = pendingAttaches.removeValue(forKey: id) {
+            if attach.stdoutWriteFd >= 0 { Darwin.close(attach.stdoutWriteFd) }
+            if attach.stderrWriteFd >= 0 { Darwin.close(attach.stderrWriteFd) }
+        }
         processes.removeValue(forKey: id)
+        // Resume any hanging awaitProcess continuations so tasks don't leak
+        if let continuations = processContinuations.removeValue(forKey: id) {
+            for c in continuations { c.resume(returning: nil) }
+        }
     }
 }
