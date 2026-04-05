@@ -102,6 +102,7 @@ actor NetworkDNSManager {
                 forward . \(gatewayIP):\(dnsPort)
                 cache 10
                 errors
+                log
             }
             """
         try corefile.write(to: corefileURL, atomically: true, encoding: .utf8)

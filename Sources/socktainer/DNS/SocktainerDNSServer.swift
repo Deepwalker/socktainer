@@ -1,5 +1,6 @@
 import Darwin
 import Foundation
+import Logging
 import Vapor
 
 struct SocktainerDNSServerKey: StorageKey {
@@ -13,18 +14,24 @@ struct SocktainerDNSServerKey: StorageKey {
 final class SocktainerDNSServer: @unchecked Sendable {
     private let lock = NSLock()
     private var entries: [String: [UInt8]] = [:]  // normalized hostname → 4-byte IPv4
+    private var log = Logger(label: "socktainer.dns")
 
     func register(hostname: String, ip: String) {
         guard let addr = Self.parseIPv4(ip) else { return }
         lock.lock()
         defer { lock.unlock() }
-        entries[Self.normalize(hostname)] = addr
+        let key = Self.normalize(hostname)
+        entries[key] = addr
+        log.info("[dns] registered \(key) → \(ip)")
     }
 
     func unregister(hostname: String) {
         lock.lock()
         defer { lock.unlock() }
-        entries.removeValue(forKey: Self.normalize(hostname))
+        let key = Self.normalize(hostname)
+        if entries.removeValue(forKey: key) != nil {
+            log.info("[dns] unregistered \(key)")
+        }
     }
 
     func start(port: Int = 2054) {
@@ -34,7 +41,7 @@ final class SocktainerDNSServer: @unchecked Sendable {
     private func serverLoop(port: Int) {
         let fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
         guard fd >= 0 else {
-            print("[SocktainerDNS] socket() failed: \(String(cString: strerror(errno)))")
+            log.error("[dns] socket() failed: \(String(cString: strerror(errno)))")
             return
         }
         defer { Darwin.close(fd) }
@@ -54,11 +61,11 @@ final class SocktainerDNSServer: @unchecked Sendable {
             }
         }
         guard bindResult == 0 else {
-            print("[SocktainerDNS] bind() failed on port \(port): \(String(cString: strerror(errno)))")
+            log.error("[dns] bind() failed on port \(port): \(String(cString: strerror(errno)))")
             return
         }
 
-        print("[SocktainerDNS] listening on 0.0.0.0:\(port)")
+        log.info("[dns] listening on 0.0.0.0:\(port)")
 
         var buf = [UInt8](repeating: 0, count: 512)
 
@@ -93,16 +100,20 @@ final class SocktainerDNSServer: @unchecked Sendable {
         guard (flags & 0x8000) == 0, (flags & 0x7800) == 0 else { return nil }
 
         guard let (qname, qtype, _) = parseQuestion(packet, offset: 12) else {
+            log.debug("[dns] malformed question, forwarding raw packet")
             return forwardToUpstream(packet)
         }
 
         let normalized = Self.normalize(qname)
+        let qtypeStr = qtype == 1 ? "A" : qtype == 28 ? "AAAA" : "type\(qtype)"
 
         if qtype == 1 {  // A query
             lock.lock()
             let ip = entries[normalized]
             lock.unlock()
             if let ip {
+                let ipStr = "\(ip[0]).\(ip[1]).\(ip[2]).\(ip[3])"
+                log.info("[dns] \(qtypeStr) \(normalized) → \(ipStr) (local)")
                 return buildAResponse(packet: packet, ip: ip)
             }
         } else if qtype == 28 {  // AAAA query — return NODATA for known hosts
@@ -110,10 +121,12 @@ final class SocktainerDNSServer: @unchecked Sendable {
             let known = entries[normalized] != nil
             lock.unlock()
             if known {
+                log.debug("[dns] \(qtypeStr) \(normalized) → NODATA (known host, no IPv6)")
                 return buildNodataResponse(packet: packet)
             }
         }
 
+        log.debug("[dns] \(qtypeStr) \(normalized) → forwarding to 1.1.1.1")
         return forwardToUpstream(packet)
     }
 
